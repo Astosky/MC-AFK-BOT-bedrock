@@ -1,6 +1,7 @@
 {
   "name": "mc-afk-bot",
-  "version": "2.0.0",
+  "version": "2.0.1",
+  "private": true,
   "description": "Minecraft Bedrock & Java AFK bot controlled via Discord",
   "main": "src/index.js",
   "type": "module",
@@ -19,7 +20,12 @@
     "prismarine-auth": "^3.1.1"
   },
   "overrides": {
-    "nethernet": "github:PrismarineJS/node-nethernet#6431f0f98a4c82d919e59fdbdb54e576e939b9dd"
+    "nethernet": "https://codeload.github.com/PrismarineJS/node-nethernet/tar.gz/6431f0f98a4c82d919e59fdbdb54e576e939b9dd",
+    "prismarine-xbox-services": "https://codeload.github.com/PrismarineJS/prismarine-xbox-services/tar.gz/052a9676f514c5470a723651b1dbb1adcf238944"
+  },
+  "resolutions": {
+    "nethernet": "https://codeload.github.com/PrismarineJS/node-nethernet/tar.gz/6431f0f98a4c82d919e59fdbdb54e576e939b9dd",
+    "prismarine-xbox-services": "https://codeload.github.com/PrismarineJS/prismarine-xbox-services/tar.gz/052a9676f514c5470a723651b1dbb1adcf238944"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
