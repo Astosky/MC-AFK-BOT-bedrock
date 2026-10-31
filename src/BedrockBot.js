@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const mcDataLoader = require('minecraft-data');
 
 const MAX_RECONNECTS = 5;
+const MAX_STARTING_RECONNECTS = 8;
 const RECONNECT_DELAY_MS = 15_000;
 const ANTI_AFK_INTERVAL_MS = 5_000;
 const TICK_INTERVAL_MS = 50; // 20 TPS server-authoritative input tick
@@ -64,7 +65,7 @@ function formatBedrockDisconnect(raw) {
 
 function isUnauthenticatedKick(raw) {
   const s = String(typeof raw === 'object' ? raw?.message || '' : raw || '');
-  return /notAuthenticated|not_authenticated|loginFailed/i.test(s);
+  return /notAuthenticated|not_authenticated|loginFailed|ErrorCode 37/i.test(s);
 }
 
 function extractBedrockMessageText(packet) {
@@ -112,6 +113,7 @@ export class BedrockBot {
     this.isDisconnecting = false;
     this.inGame = false;
     this.reconnectAttempts = 0;
+    this.serverIsStarting = false;
     this.spawnedOnce = false;
     this.realUsername = null;
     this.serverVersion = BEDROCK_CURRENT_VERSION;
@@ -141,6 +143,14 @@ export class BedrockBot {
 
   send(content) {
     this.discordChannel.send(content).catch(() => {});
+  }
+
+  _failFatally(messagePayload) {
+    if (this.isFatal || this.isStopping) return;
+    this.isFatal = true;
+    this.send(messagePayload);
+    this.stop();
+    if (this.onFatal) this.onFatal();
   }
 
   // ─── Microsoft / Xbox Live pre-authentication ────────────────────────────────
@@ -176,13 +186,9 @@ export class BedrockBot {
       this.authflow = flow;
       return true;
     } catch (err) {
-      if (!this.isFatal && !this.isStopping) {
-        this.isFatal = true;
-        this.send(
-          msg(`Microsoft authentication failed\n-# ${err.message || String(err)} · bot removed`)
-        );
-        if (this.onFatal) this.onFatal();
-      }
+      this._failFatally(
+        msg(`Microsoft authentication failed\n-# ${err.message || String(err)} · bot removed`)
+      );
       return false;
     }
   }
@@ -203,10 +209,64 @@ export class BedrockBot {
     this.inGame = false;
   }
 
+  _handleDiscoveryOrAuthError(err) {
+    const name = this.realUsername || this.options.username;
+
+    if (err?.code === 'ENOTFOUND') {
+      this._failFatally(
+        msg(`**${name}** — unknown host **${this.options.host}**\n-# DNS lookup failed (ENOTFOUND) · bot removed`)
+      );
+      return true;
+    }
+
+    // If the bot had not yet spawned once and the server is definitively Offline,
+    // fail immediately with a clear message instead of locking the username for 5 retries.
+    if (err?.serverOffline && !this.spawnedOnce) {
+      this._failFatally(
+        msgSections(
+          `**${name}** — **${this.options.host}** is currently **Offline**`,
+          `-# Start your server first, then run \`!join ${this.options.host}:${this.options.port} ${this.options.username}\` · bot removed`
+        )
+      );
+      return true;
+    }
+
+    if (err?.javaOnly && !this.spawnedOnce) {
+      const javaCmd =
+        this.options.auth === 'microsoft'
+          ? `!premjoin java ${this.options.host}`
+          : `!join java ${this.options.host} ${this.options.username}`;
+      this._failFatally(
+        msgSections(
+          `**${name}** — **${this.options.host}** is running **Java Edition** (${err.javaVersion})`,
+          `-# No Bedrock/Geyser listener responded on port ${this.options.port}. Use \`${javaCmd}\` (or install GeyserMC for Bedrock) · bot removed`
+        )
+      );
+      return true;
+    }
+
+    if (err?.authRequired && this.options.auth !== 'microsoft') {
+      this._failFatally(
+        msgSections(
+          `**${name}** — **${this.options.host}** requires Microsoft/Xbox login`,
+          `-# Enable **Cracked** in your server Options, or use \`!premjoin bedrock ${this.options.host}:${this.options.port}\` · bot removed`
+        )
+      );
+      return true;
+    }
+
+    if (err?.serverStarting) {
+      this.serverIsStarting = true;
+    }
+
+    return false;
+  }
+
   async connect() {
     if (this.isStopping || this.isFatal) return;
 
     this.isDisconnecting = false;
+    this.serverIsStarting = false;
     this.lastErrorReason = null;
     this._cleanupClient();
 
@@ -220,9 +280,8 @@ export class BedrockBot {
 
     this.connectAbort = new AbortController();
 
-    let client, discovery;
     try {
-      ({ client, discovery } = await connectBedrockClient(
+      await connectBedrockClient(
         {
           host: this.options.host,
           port: this.options.port || 19132,
@@ -231,36 +290,32 @@ export class BedrockBot {
           profilesFolder: MS_CACHE_DIR,
           authflow: this.authflow || undefined,
           version: this.options.version || undefined,
-          conLog: null, // Silence noisy stdout logs on Pterodactyl
+          conLog: null, // Silence noisy stdout logs on Pterodactyl / Bonto
         },
-        this.connectAbort.signal
-      ));
+        this.connectAbort.signal,
+        (client, discovery) => {
+          this.client = client;
+          this.options.port = discovery.port || this.options.port;
+          this.serverVersion = client.options.version || discovery.version || BEDROCK_CURRENT_VERSION;
+          this.transportLabel =
+            discovery.transport === 'nethernet'
+              ? `NetherNet${discovery.signalling === 'http' ? '/HTTP' : ''}`
+              : 'RakNet';
+
+          if (!discovery.reachable && discovery.diagnostic) {
+            this.lastErrorReason = discovery.diagnostic;
+          }
+
+          this._configureProtocolCapabilities(this.serverVersion);
+          this._attachListeners(client);
+        }
+      );
     } catch (err) {
       if (this.isStopping || this.isFatal) return;
+      if (this._handleDiscoveryOrAuthError(err)) return;
       this.lastErrorReason = err?.message || String(err);
       this.handleDisconnect();
-      return;
     }
-
-    if (this.isStopping || this.isFatal) {
-      try { client.close(); } catch {}
-      return;
-    }
-
-    this.client = client;
-    this.options.port = discovery.port || this.options.port;
-    this.serverVersion = client.options.version || discovery.version || BEDROCK_CURRENT_VERSION;
-    this.transportLabel =
-      discovery.transport === 'nethernet'
-        ? `NetherNet${discovery.signalling === 'http' ? '/HTTP' : ''}`
-        : 'RakNet';
-
-    if (!discovery.reachable) {
-      this.lastErrorReason = `No ping/signalling response on ${this.options.host}:${this.options.port} (is the server online?)`;
-    }
-
-    this._configureProtocolCapabilities(this.serverVersion);
-    this._attachListeners(client);
   }
 
   _configureProtocolCapabilities(version) {
@@ -315,6 +370,7 @@ export class BedrockBot {
 
       this.inGame = true;
       this.reconnectAttempts = 0;
+      this.serverIsStarting = false;
       this.isDisconnecting = false;
       this.lastErrorReason = null;
 
@@ -450,15 +506,12 @@ export class BedrockBot {
 
       // Permanent auth mismatch: server has online-mode=true (Cracked disabled)
       if (this.options.auth !== 'microsoft' && isUnauthenticatedKick(packet)) {
-        this.isFatal = true;
-        this.send(
+        this._failFatally(
           msgSections(
             `**${name}** — **${this.options.host}** requires Microsoft/Xbox login`,
             `-# Enable **Cracked** in your server settings, or use \`!premjoin bedrock ${this.options.host}:${this.options.port}\` · bot removed`
           )
         );
-        this.stop();
-        if (this.onFatal) this.onFatal();
         return;
       }
 
@@ -476,18 +529,14 @@ export class BedrockBot {
 
     client.on('error', (err) => {
       if (this.isStopping || this.isFatal) return;
-      const code = err?.code || '';
-      if (code === 'ENOTFOUND') {
-        this.isFatal = true;
-        const name = this.realUsername || this.options.username;
-        this.send(
-          msg(`**${name}** — unknown host **${this.options.host}**\n-# DNS lookup failed (ENOTFOUND) · bot removed`)
-        );
-        this.stop();
-        if (this.onFatal) this.onFatal();
+      if (this._handleDiscoveryOrAuthError(err)) return;
+
+      const msgStr = err?.message || String(err);
+      // Do not overwrite an already-captured discovery diagnostic with a generic fallback timeout
+      if (msgStr === 'Connect timed out' && this.lastErrorReason) {
         return;
       }
-      this.lastErrorReason = err?.message || String(err);
+      this.lastErrorReason = msgStr;
     });
 
     client.on('close', () => {
@@ -505,12 +554,13 @@ export class BedrockBot {
     this.inGame = false;
 
     const name = this.realUsername || this.options.username;
+    const maxAttempts = this.serverIsStarting ? MAX_STARTING_RECONNECTS : MAX_RECONNECTS;
 
-    if (this.reconnectAttempts >= MAX_RECONNECTS) {
-      const reasonSuffix = this.lastErrorReason ? `\n-# Last error: ${this.lastErrorReason}` : '';
+    if (this.reconnectAttempts >= maxAttempts) {
+      const reasonSuffix = this.lastErrorReason ? ` · ${this.lastErrorReason}` : '';
       this.send(
         msg(
-          `**${name}** — max reconnects reached on **${this.options.host}**\n-# removed after ${MAX_RECONNECTS} failed attempts${reasonSuffix}`
+          `**${name}** — max reconnects reached on **${this.options.host}**\n-# removed after ${maxAttempts} failed attempts${reasonSuffix}`
         )
       );
       this.stop();
@@ -523,7 +573,7 @@ export class BedrockBot {
     const reasonLine = this.lastErrorReason ? ` · ${this.lastErrorReason}` : '';
     this.send(
       msg(
-        `**${name}** — reconnecting to **${this.options.host}:${this.options.port}**\n-# attempt ${this.reconnectAttempts}/${MAX_RECONNECTS} · in ${delaySec}s${reasonLine}`
+        `**${name}** — reconnecting to **${this.options.host}:${this.options.port}**\n-# attempt ${this.reconnectAttempts}/${maxAttempts} · in ${delaySec}s${reasonLine}`
       )
     );
 
