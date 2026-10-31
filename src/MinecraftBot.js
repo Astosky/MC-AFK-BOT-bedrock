@@ -4,10 +4,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import mineflayer from 'mineflayer';
-import { pathfinder, Movements } from 'mineflayer-pathfinder';
 import { msg, msgSections } from './ui.js';
 
-const FATAL_CODES = new Set(['ENOTFOUND', 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET']);
+const FATAL_CODES = new Set(['ENOTFOUND']);
 const MAX_RECONNECTS = 5;
 const RECONNECT_DELAY_MS = 15_000;
 const ANTI_AFK_INTERVAL_MS = 5_000;
@@ -44,10 +43,14 @@ function extractText(node) {
 }
 
 function parseKickReason(reason) {
+  if (!reason) return 'Disconnected';
+  if (typeof reason === 'object') {
+    return extractText(reason).trim() || JSON.stringify(reason);
+  }
   try {
     return extractText(JSON.parse(reason)).trim() || reason;
   } catch {
-    return reason;
+    return String(reason);
   }
 }
 
@@ -60,7 +63,8 @@ export class MinecraftBot {
    * @param {string}   [authPassword]   optional stable password injected by BotManager (cracked bots)
    */
   constructor(options, discordChannel, onFatal, onRealUsername, authPassword) {
-    this.options = options;
+    this.edition = 'java';
+    this.options = { ...options, port: options.port || 25565 };
     this.discordChannel = discordChannel;
     this.onFatal = onFatal;
     this.onRealUsername = onRealUsername;
@@ -74,13 +78,14 @@ export class MinecraftBot {
     this.reconnectAttempts = 0;
     this.spawnedOnce = false;
     this.realUsername = null;
+    this.serverVersion = null;
+    this.lastErrorReason = null;
 
-    // FIX: Accept an externally injected password from BotManager so that
-    // a !leave + !join cycle on the same server reuses the original registered
-    // password and AuthMe /login still succeeds.
-    // Falls back to generating a fresh one only when BotManager doesn't supply one
-    // (e.g. premium bots that don't need AuthMe registration).
     this.authPassword = authPassword || (Math.random().toString(36).slice(2, 12) + 'Aa1!');
+  }
+
+  get isOnline() {
+    return Boolean(this.bot?.entity);
   }
 
   // Safely send a V2 container message to Discord; swallows channel errors
@@ -89,57 +94,36 @@ export class MinecraftBot {
   }
 
   // ─── Microsoft pre-authentication ────────────────────────────────────────────
-  //
-  // Bug (original): mineflayer opens the TCP connection to the Minecraft server
-  // first, then waits for the server handshake before starting OAuth. If the
-  // server is unreachable the error fires before onMsaCode is ever called —
-  // the user never sees the login link and the bot is silently removed.
-  //
-  // Fix: call prismarine-auth directly BEFORE creating the mineflayer bot so the
-  // OAuth flow (and Discord prompt) completes first. The token is then cached at
-  // the EXACT same path that minecraft-protocol uses (nmp-cache inside the MC
-  // folder), so mineflayer picks it up silently without a second OAuth prompt.
-  //
-  // On reconnect, if the cached token is still valid this is a near-instant no-op.
-  // Expired refresh tokens (typically after 90 days) trigger a new OAuth prompt.
+
   async _preAuth() {
     try {
-      // prismarine-auth is a CJS module — access module.exports via .default
       const { default: prismarineAuth } = await import('prismarine-auth');
       const { Authflow, Titles } = prismarineAuth;
 
-      // Options must exactly match what minecraft-protocol's validateOptions() sets,
-      // otherwise prismarine-auth writes to a different cache slot and mineflayer
-      // won't find the token (triggering a duplicate OAuth prompt).
       const authOptions = {
         authTitle: Titles.MinecraftNintendoSwitch,
         deviceType: 'Nintendo',
-        flow: 'live', // required — MicrosoftAuthFlow throws if omitted
+        flow: 'live',
       };
 
       const flow = new Authflow(
         this.options.username,  // Discord user ID — stable unique cache key
-        MS_CACHE_DIR,           // same path as minecraft-protocol uses
+        MS_CACHE_DIR,           // Shared cache directory passed to mineflayer as profilesFolder
         authOptions,
         (data) => {
-          // Only called when a new login is actually needed (no valid cached token)
           const mins = Math.floor((data.expires_in || 900) / 60);
           this.send(
             msgSections(
               `Microsoft login required — **${this.options.host}**`,
               `Open: <${data.verification_uri}>\n\nCode: \`${data.user_code}\``,
-              `-# Expires in ${mins} min. Bot joins automatically after sign-in.`
+              `-# Expires in ${mins} min. Bot joins Java automatically after sign-in.`
             )
           );
         }
       );
 
-      // Blocks until OAuth is complete or cached token is validated/refreshed.
-      // fetchProfile: false — we only need the access token here; mineflayer
-      // will fetch the profile itself when it connects.
       await flow.getMinecraftJavaToken({ fetchProfile: false });
       return true;
-
     } catch (err) {
       if (!this.isFatal && !this.isStopping) {
         this.isFatal = true;
@@ -155,66 +139,56 @@ export class MinecraftBot {
   // ─── Connection ───────────────────────────────────────────────────────────────
 
   async connect() {
-    // FIX: Guard against connect() being called after stop() — e.g. if a
-    // reconnect timer fires after an explicit !leave command races with it.
     if (this.isStopping || this.isFatal) return;
 
     this.isDisconnecting = false;
+    this.lastErrorReason = null;
 
-    // Remove all listeners from any previous bot instance before creating a new one.
-    // Without this, stale listeners from the dead bot can fire spurious events after
-    // reconnect (especially `error`), corrupting state.
     if (this.bot) {
       this.bot.removeAllListeners();
-      try { this.bot.quit(); } catch { }
+      try { this.bot.quit(); } catch {}
       this.bot = null;
     }
 
-    // For Microsoft accounts: authenticate BEFORE opening the server connection.
-    // Guarantees the OAuth prompt appears even if the server is unreachable.
     if (this.options.auth === 'microsoft') {
       const ok = await this._preAuth();
-      if (!ok) return; // auth failed — fatal error already reported
+      if (!ok) return;
     }
 
-    // FIX: Re-check isStopping after the async _preAuth call — !leave may have
-    // been called while waiting for OAuth to complete.
     if (this.isStopping || this.isFatal) return;
 
-    // Token is now cached at MS_CACHE_DIR; mineflayer will read it silently.
-    // No onMsaCode needed — the token is guaranteed to be present.
     const botOptions = {
       host: this.options.host,
       port: this.options.port || 25565,
       username: this.options.username,
       auth: this.options.auth || 'offline',
+      profilesFolder: MS_CACHE_DIR,
       version: this.options.version || false,
       hideErrors: true,
     };
 
     this.bot = mineflayer.createBot(botOptions);
-    this.bot.loadPlugin(pathfinder);
 
     this.bot.on('spawn', () => {
-      // FIX: Guard — if stop() was called between createBot and spawn, abort
       if (this.isStopping || this.isFatal) return;
 
       this.reconnectAttempts = 0;
       this.isDisconnecting = false;
+      this.lastErrorReason = null;
       const name = this.bot.username;
       this.realUsername = name;
+      this.serverVersion = this.bot.version || this.bot._client?.version || null;
 
-      // Notify BotManager of the real MC username on the very first spawn
       if (!this.spawnedOnce && this.onRealUsername) {
         this.spawnedOnce = true;
         this.onRealUsername(name);
       }
 
-      this.send(msg(`**${name}** connected to **${this.options.host}**`));
+      const verTag = this.serverVersion ? `Java ${this.serverVersion}` : 'Java';
+      this.send(
+        msg(`**${name}** connected to **${this.options.host}:${this.options.port}**\n-# ${verTag}`)
+      );
       this.startAntiAfk();
-
-      const defaultMove = new Movements(this.bot);
-      this.bot.pathfinder.setMovements(defaultMove);
     });
 
     // Intercept all server chat — catches AuthMe, nLogin, FastLogin prompts
@@ -224,16 +198,18 @@ export class MinecraftBot {
 
       if (REGISTER_PATTERNS.some((p) => p.test(t))) {
         setTimeout(() => {
-          if (this.bot && !this.isStopping)
+          if (this.bot && !this.isStopping) {
             this.bot.chat(`/register ${this.authPassword} ${this.authPassword}`);
+          }
         }, 800);
         return;
       }
 
       if (LOGIN_PATTERNS.some((p) => p.test(t))) {
         setTimeout(() => {
-          if (this.bot && !this.isStopping)
+          if (this.bot && !this.isStopping) {
             this.bot.chat(`/login ${this.authPassword}`);
+          }
         }, 800);
       }
     });
@@ -252,11 +228,13 @@ export class MinecraftBot {
         this.isFatal = true;
         const name = this.realUsername || this.options.username;
         this.send(
-          msg(`**${name}** — cannot reach **${this.options.host}**\n-# ${err.code} · bot removed`)
+          msg(`**${name}** — unknown host **${this.options.host}**\n-# ${err.code} · bot removed`)
         );
         this.stop();
         if (this.onFatal) this.onFatal();
+        return;
       }
+      this.lastErrorReason = err.code || err.message || String(err);
     });
 
     this.bot.on('kicked', (reason) => {
@@ -264,6 +242,7 @@ export class MinecraftBot {
       this.isDisconnecting = true;
       const name = this.bot?.username || this.realUsername || this.options.username;
       const readable = parseKickReason(reason);
+      this.lastErrorReason = readable;
       this.send(
         msgSections(
           `**${name}** kicked from **${this.options.host}**`,
@@ -273,12 +252,10 @@ export class MinecraftBot {
       this.handleDisconnect();
     });
 
-    // FIX: 'end' fires AFTER 'kicked' in mineflayer — original code checked
-    // isDisconnecting but could still double-fire handleDisconnect if a kick
-    // + end raced. Added isFatal guard to cover the error → stop() → end path.
-    this.bot.on('end', () => {
+    this.bot.on('end', (reason) => {
       if (this.isStopping || this.isFatal || this.isDisconnecting) return;
       this.isDisconnecting = true;
+      if (!this.lastErrorReason && reason) this.lastErrorReason = String(reason);
       this.handleDisconnect();
     });
   }
@@ -290,8 +267,11 @@ export class MinecraftBot {
     const name = this.realUsername || this.options.username;
 
     if (this.reconnectAttempts >= MAX_RECONNECTS) {
+      const reasonSuffix = this.lastErrorReason ? `\n-# Last error: ${this.lastErrorReason}` : '';
       this.send(
-        msg(`**${name}** — max reconnects reached\n-# removed after ${MAX_RECONNECTS} failed attempts`)
+        msg(
+          `**${name}** — max reconnects reached on **${this.options.host}**\n-# removed after ${MAX_RECONNECTS} failed attempts${reasonSuffix}`
+        )
       );
       this.stop();
       if (this.onFatal) this.onFatal();
@@ -300,9 +280,10 @@ export class MinecraftBot {
 
     this.reconnectAttempts++;
     const delaySec = RECONNECT_DELAY_MS / 1000;
+    const reasonLine = this.lastErrorReason ? ` · ${this.lastErrorReason}` : '';
     this.send(
       msg(
-        `**${name}** — reconnecting to **${this.options.host}**\n-# attempt ${this.reconnectAttempts}/${MAX_RECONNECTS} · in ${delaySec}s`
+        `**${name}** — reconnecting to **${this.options.host}:${this.options.port}**\n-# attempt ${this.reconnectAttempts}/${MAX_RECONNECTS} · in ${delaySec}s${reasonLine}`
       )
     );
 
@@ -364,7 +345,7 @@ export class MinecraftBot {
     if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
     if (this.bot) {
       this.bot.removeAllListeners();
-      try { this.bot.quit(); } catch { }
+      try { this.bot.quit(); } catch {}
       this.bot = null;
     }
   }
