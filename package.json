@@ -10,7 +10,7 @@
     "dev": "nodemon src/index.js"
   },
   "engines": {
-    "node": ">=20.3.0"
+    "node": ">=24.0.0"
   },
   "dependencies": {
     "bedrock-protocol": "^3.61.0",
