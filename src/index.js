@@ -33,7 +33,6 @@ const client = new Client({
 
 const botManager = new BotManager();
 
-
 client.on('clientReady', () => {
   if (GUILD_ID) {
     console.log(`Discord bot logged in as ${client.user.tag} — restricted to guild ${GUILD_ID}`);
@@ -45,13 +44,13 @@ client.on('clientReady', () => {
 // ─── Help ─────────────────────────────────────────────────────────────────────
 
 const COMMANDS = [
-  { usage: '!join <ip[:port]> [username]',  desc: 'Join a cracked server.' },
-  { usage: '!premjoin <ip[:port]>',         desc: 'Join an online-mode server via Microsoft account.' },
-  { usage: '!leave <ip> <username>',        desc: 'Disconnect a bot.' },
-  { usage: '!say <ip> <username> <message>', desc: 'Send a chat message in-game.' },
-  { usage: '!bots',                         desc: 'List all active bots.' },
-  { usage: '!jump <ip> <username>',         desc: 'Force a bot to jump.' },
-  { usage: '!help',                         desc: 'Show this reference.' },
+  { usage: '!join [bedrock|java] <ip[:port]> [username]', desc: 'Join a cracked server (defaults to Bedrock).' },
+  { usage: '!premjoin [bedrock|java] <ip[:port]>',        desc: 'Join via Microsoft / Xbox account (defaults to Bedrock).' },
+  { usage: '!leave <ip> <username>',                      desc: 'Disconnect a bot.' },
+  { usage: '!say <ip> <username> <message>',              desc: 'Send chat or a /command in-game.' },
+  { usage: '!bots',                                       desc: 'List all active bots and versions.' },
+  { usage: '!jump <ip> <username>',                       desc: 'Force a bot to jump.' },
+  { usage: '!help',                                       desc: 'Show this reference.' },
 ];
 
 function buildHelp() {
@@ -66,7 +65,7 @@ function buildHelp() {
 
   c.addTextDisplayComponents(
     text(
-      '**Send Minecraft AFK bots to any server and control them from Discord.**\n' +
+      '**Send Minecraft Bedrock (26.60) & Java AFK bots to any server from Discord.**\n' +
       '\n' +
       '**Main Commands:**\n' +
       commandLines
@@ -76,23 +75,24 @@ function buildHelp() {
   c.addSeparatorComponents(thinDivider());
 
   c.addTextDisplayComponents(
-    text('**Made by:** Ayliee  ·  AeroX Development')
+    text(
+      '-# Default ports: Bedrock `19132` (NetherNet & RakNet) · Java `25565`. Wrap spaced gamertags in `"quotes"`.\n' +
+      '-# Bots auto-jump every 5s, rotate view every 30s, and auto-respawn to prevent AFK kicks.'
+    )
   );
 
   c.addSeparatorComponents(thinDivider());
 
   c.addTextDisplayComponents(
-    text('-# Bots auto-jump every 5s and rotate view every 30s to prevent AFK kicks.')
+    text('**Made by:** Ayliee  ·  AeroX Development')
   );
 
   return { components: [c], flags: MessageFlags.IsComponentsV2 };
 }
 
 // ─── Per-user command rate limiting ───────────────────────────────────────────
-// FIX: No rate limiting existed — any user could spam commands to spawn bots.
-// Simple cooldown map: userId → timestamp of last command.
 
-const COOLDOWN_MS = 3_000; // 3 seconds between commands per user
+const COOLDOWN_MS = 3_000;
 const cooldowns = new Map();
 
 function isRateLimited(userId) {
@@ -103,35 +103,97 @@ function isRateLimited(userId) {
   return false;
 }
 
-// ─── Username validation ───────────────────────────────────────────────────────
-// FIX: No validation on cracked usernames — Minecraft usernames must be
-// 3-16 chars, alphanumeric + underscores only. Invalid names cause mineflayer
-// to fail silently or produce confusing errors.
+// ─── Argument & address parsing helpers ───────────────────────────────────────
 
-const MC_USERNAME_RE = /^[a-zA-Z0-9_]{3,16}$/;
+const JAVA_USERNAME_RE = /^[a-zA-Z0-9_]{3,16}$/;
+const BEDROCK_USERNAME_RE = /^[a-zA-Z0-9_][a-zA-Z0-9_ -]{1,14}[a-zA-Z0-9_]$/;
 
-function isValidUsername(name) {
-  return MC_USERNAME_RE.test(name);
+function isValidUsername(name, edition) {
+  if (edition === 'java') return JAVA_USERNAME_RE.test(name);
+  return (JAVA_USERNAME_RE.test(name) || BEDROCK_USERNAME_RE.test(name)) && !/\s{2,}/.test(name);
+}
+
+// Tokenize arguments while supporting "quoted Bedrock gamertags" and keeping raw tail index
+function tokenizeCommand(input) {
+  const tokens = [];
+  const re = /"([^"]+)"|'([^']+)'|(\S+)/g;
+  let match;
+  while ((match = re.exec(input)) !== null) {
+    tokens.push({
+      value: match[1] ?? match[2] ?? match[3],
+      endIndex: re.lastIndex,
+    });
+  }
+  return tokens;
+}
+
+// Sanitize Discord markdown links, <http://...>, schemes, and split host[:port]
+function parseServerAddress(raw, defaultPort) {
+  if (!raw) return null;
+  let cleaned = String(raw).trim();
+
+  // Extract target from markdown [label](url) if pasted
+  const mdMatch = cleaned.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+  if (mdMatch) cleaned = mdMatch[1];
+
+  cleaned = cleaned
+    .replace(/^<+|>+$/g, '')
+    .replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '')
+    .replace(/\/.*$/, '')
+    .trim();
+
+  if (!cleaned) return null;
+
+  let host = cleaned;
+  let port = defaultPort;
+
+  // IPv6 [::1]:19132
+  const ipv6Match = cleaned.match(/^\[([^\]]+)\](?::(\d+))?$/);
+  if (ipv6Match) {
+    host = ipv6Match[1];
+    if (ipv6Match[2]) port = parseInt(ipv6Match[2], 10);
+  } else {
+    const colonIdx = cleaned.lastIndexOf(':');
+    if (colonIdx > 0 && cleaned.indexOf(':') === colonIdx) {
+      const maybePort = cleaned.slice(colonIdx + 1);
+      host = cleaned.slice(0, colonIdx);
+      if (/^\d+$/.test(maybePort)) {
+        const parsed = parseInt(maybePort, 10);
+        if (parsed >= 1 && parsed <= 65535) port = parsed;
+      }
+    }
+  }
+
+  if (!host) return null;
+  return { host, port };
+}
+
+function extractEdition(token) {
+  if (!token) return null;
+  const lower = token.toLowerCase();
+  if (lower === 'bedrock' || lower === 'be') return 'bedrock';
+  if (lower === 'java' || lower === 'je') return 'java';
+  return null;
 }
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 client.on('messageCreate', async (message) => {
-  // Ignore bots, DMs, empty messages, and messages outside the configured guild
   if (message.author.bot) return;
   if (!message.guild) return;
   if (!message.content) return;
   if (GUILD_ID && message.guild.id !== GUILD_ID) return;
 
-  const args = message.content.trim().split(/\s+/);
+  const trimmed = message.content.trim();
+  const tokens = tokenizeCommand(trimmed);
+  if (tokens.length === 0) return;
+
+  const args = tokens.map((t) => t.value);
   const command = args[0].toLowerCase();
 
-  // Only process known commands before rate-limit check to avoid wasting the
-  // cooldown slot on unrelated messages
   const knownCommands = ['!help', '!join', '!premjoin', '!leave', '!say', '!bots', '!jump'];
   if (!knownCommands.includes(command)) return;
 
-  // FIX: Rate limit check — applied after command recognition
   if (isRateLimited(message.author.id)) {
     return message.reply(msg('-# Please wait a moment before sending another command.'));
   }
@@ -141,50 +203,82 @@ client.on('messageCreate', async (message) => {
     return message.reply(buildHelp());
   }
 
-  // !join <ip[:port]> [username]  —  cracked / offline-mode server
+  // !join [bedrock|java] <ip[:port]> [username]
   if (command === '!join') {
-    if (!args[1]) return message.reply(msg('usage: `!join <ip[:port]> [username]`'));
-    const [host, rawPort] = args[1].split(':');
-    const port = parseInt(rawPort) || 25565;
-    const username = args[2] || `AFK_${Math.floor(Math.random() * 9999)}`;
-
-    // FIX: Validate username before attempting to connect
-    if (!isValidUsername(username)) {
-      return message.reply(msg(`invalid username **${username}**\n-# Must be 3-16 characters, letters/numbers/underscores only.`));
+    if (!args[1]) {
+      return message.reply(msg('usage: `!join [bedrock|java] <ip[:port]> [username]`'));
     }
 
-    botManager.joinCracked({ host, port, username }, message.channel);
+    const explicitEdition = extractEdition(args[1]);
+    const edition = explicitEdition || 'bedrock';
+    const addrArg = explicitEdition ? args[2] : args[1];
+    const usernameArg = explicitEdition ? args[3] : args[2];
+
+    if (!addrArg) {
+      return message.reply(msg(`usage: \`!join ${edition} <ip[:port]> [username]\``));
+    }
+
+    const defaultPort = edition === 'java' ? 25565 : 19132;
+    const parsed = parseServerAddress(addrArg, defaultPort);
+    if (!parsed) {
+      return message.reply(msg('invalid server address — example: `!join bedrock RndmCraft.aternos.me`'));
+    }
+
+    const username = usernameArg || `AFK_${Math.floor(1000 + Math.random() * 9000)}`;
+    if (!isValidUsername(username, edition)) {
+      const rule =
+        edition === 'java'
+          ? '3-16 characters, letters/numbers/underscores only.'
+          : '3-16 characters, letters/numbers/spaces/underscores.';
+      return message.reply(msg(`invalid username **${username}**\n-# Must be ${rule}`));
+    }
+
+    botManager.joinCracked({ edition, host: parsed.host, port: parsed.port, username }, message.channel);
     return;
   }
 
-  // !premjoin <ip[:port]>  —  online-mode server via Microsoft account
+  // !premjoin [bedrock|java] <ip[:port]>
   if (command === '!premjoin') {
-    if (!args[1]) return message.reply(msg('usage: `!premjoin <ip[:port]>`'));
-    const [host, rawPort] = args[1].split(':');
-    const port = parseInt(rawPort) || 25565;
-    botManager.joinPremium(message.author.id, { host, port }, message.channel);
+    if (!args[1]) {
+      return message.reply(msg('usage: `!premjoin [bedrock|java] <ip[:port]>`'));
+    }
+
+    const explicitEdition = extractEdition(args[1]);
+    const edition = explicitEdition || 'bedrock';
+    const addrArg = explicitEdition ? args[2] : args[1];
+
+    if (!addrArg) {
+      return message.reply(msg(`usage: \`!premjoin ${edition} <ip[:port]>\``));
+    }
+
+    const defaultPort = edition === 'java' ? 25565 : 19132;
+    const parsed = parseServerAddress(addrArg, defaultPort);
+    if (!parsed) {
+      return message.reply(msg('invalid server address — example: `!premjoin bedrock RndmCraft.aternos.me`'));
+    }
+
+    botManager.joinPremium(message.author.id, { edition, host: parsed.host, port: parsed.port }, message.channel);
     return;
   }
 
   // !leave <ip> <username>
   if (command === '!leave') {
     if (!args[1] || !args[2]) return message.reply(msg('usage: `!leave <ip> <username>`'));
-    const [host] = args[1].split(':');
-    botManager.removeBot(args[2], host, message.channel);
+    const parsed = parseServerAddress(args[1], 19132);
+    if (!parsed) return message.reply(msg('invalid server address'));
+    botManager.removeBot(args[2], parsed.host, message.channel);
     return;
   }
 
-  // FIX: !say now requires <ip> so BotManager can find the correct bot when
-  // the same username exists on multiple servers.
-  // New usage: !say <ip> <username> <message...>
+  // !say <ip> <username> <message...>
   if (command === '!say') {
     if (!args[1] || !args[2] || !args[3]) {
       return message.reply(msg('usage: `!say <ip> <username> <message>`'));
     }
-    const [host] = args[1].split(':');
-    const username = args[2];
-    const chatText = args.slice(3).join(' ');
-    botManager.say(username, host, chatText, message.channel);
+    const parsed = parseServerAddress(args[1], 19132);
+    if (!parsed) return message.reply(msg('invalid server address'));
+    const chatText = trimmed.slice(tokens[2].endIndex).trim();
+    botManager.say(args[2], parsed.host, chatText, message.channel);
     return;
   }
 
@@ -196,8 +290,9 @@ client.on('messageCreate', async (message) => {
   // !jump <ip> <username>
   if (command === '!jump') {
     if (!args[1] || !args[2]) return message.reply(msg('usage: `!jump <ip> <username>`'));
-    const [host] = args[1].split(':');
-    botManager.jump(args[2], host, message.channel);
+    const parsed = parseServerAddress(args[1], 19132);
+    if (!parsed) return message.reply(msg('invalid server address'));
+    botManager.jump(args[2], parsed.host, message.channel);
     return;
   }
 });

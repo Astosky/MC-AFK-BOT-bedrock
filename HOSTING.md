@@ -1,15 +1,17 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  MC AFK Bot — Pterodactyl Hosting Guide
+  MC AFK Bot (Bedrock 26.60 & Java) — Pterodactyl Hosting Guide
   Made by Ayliee · AeroX Development
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 REQUIREMENTS
 ────────────
-  • Pterodactyl panel with a Node.js egg (v18 or higher)
+  • Pterodactyl panel with a Node.js egg (v20.3+ recommended: Node 20, 22, or 24)
+  • Outbound TCP & UDP internet access from the container (Bedrock uses UDP /
+    WebRTC + TCP/HTTP on port 19132; Java uses TCP on port 25565)
   • A Discord bot token from https://discord.com/developers/applications
   • The bot application must have these Privileged Gateway Intents enabled:
       – Message Content Intent
-      – Server Members Intent  (optional but recommended)
+      – Server Members Intent  (optional)
 
 STEP 1 — CREATE THE EGG (if not already set up)
 ─────────────────────────────────────────────────
@@ -22,28 +24,32 @@ STEP 1 — CREATE THE EGG (if not already set up)
   Recommended startup command:
     npm install --omit=dev && npm start
 
+  NOTE: `.npmrc` includes `ignore-scripts=true` so Pterodactyl containers do NOT
+  need `cmake` or a C++ compiler installed.
+
 STEP 2 — CREATE THE SERVER
 ────────────────────────────
   Admin → Servers → Create New
     • Choose your Node.js egg
-    • Set Node.js version to 18 or higher
-    • RAM: 256 MB minimum (512 MB recommended if running many bots)
+    • Set Docker image / Node.js version to Node 20, 22, or 24
+    • RAM: 256 MB minimum (512 MB recommended if running multiple bots)
     • Disk: 512 MB minimum
 
 STEP 3 — UPLOAD THE BOT
 ─────────────────────────
-  In your server's File Manager:
-    1. Upload mc-afk-bot-fixed.zip to the root of the server
-    2. Right-click the zip → Extract
-    3. The result should look like:
-         /home/container/
-           src/
-             index.js
-             BotManager.js
-             MinecraftBot.js
-             ui.js
-           package.json
-           .env.example
+  Upload the repository files (or pull directly from Git) so the server root
+  looks like:
+    /home/container/
+      src/
+        index.js
+        BotManager.js
+        BedrockBot.js
+        bedrockTransport.js
+        MinecraftBot.js
+        ui.js
+      .npmrc
+      package.json
+      .env.example
 
 STEP 4 — SET ENVIRONMENT VARIABLES
 ─────────────────────────────────────
@@ -83,28 +89,22 @@ STEP 6 — INVITE THE BOT
 
 COMMANDS
 ────────
-  !join <ip[:port]> [username]   Join a cracked server
-  !premjoin <ip[:port]>          Join an online-mode server (Microsoft login)
-  !leave <ip> <username>         Disconnect a bot
-  !say <username> <message>      Send a chat message in-game
-  !bots                          List all active bots
-  !jump <ip> <username>          Force a bot to jump
-  !help                          Show command reference in Discord
+  !join [bedrock|java] <ip[:port]> [username]   Join a cracked server (default: bedrock)
+  !premjoin [bedrock|java] <ip[:port]>          Join via Microsoft / Xbox account
+  !leave <ip> <username>                        Disconnect a bot
+  !say <ip> <username> <message>                Send chat or /command in-game
+  !bots                                         List all active bots
+  !jump <ip> <username>                         Force a bot to jump
+  !help                                         Show command reference in Discord
 
-GUILD ID RESTRICTION
-─────────────────────
-  Setting GUILD_ID limits all commands to one Discord server.
-  Any message from another server is silently ignored.
-  To get your server ID:
-    1. Open Discord Settings → Advanced → Enable Developer Mode
-    2. Right-click your server icon → Copy Server ID
-
-NOTES
-─────
-  • Microsoft (premium) auth tokens are cached in auth-cache/ inside the
-    server folder. Delete that folder to force a new Microsoft login.
-  • Bots auto-jump every 5 seconds and look around every 30 seconds to
-    prevent AFK kicks.
-  • Each bot auto-reconnects up to 5 times before being removed.
+ATERNOS & BEDROCK 26.60 NOTES
+─────────────────────────────
+  • Since Minecraft Bedrock 26.60, Aternos and Bedrock Dedicated Servers use
+    NetherNet on default port `19132` (automatically handled by this bot).
+  • Make sure your Aternos server is started/online before running `!join`.
+  • If using `!join bedrock <ip>` (no Microsoft login), enable "Cracked" in
+    your Aternos server Options; otherwise use `!premjoin bedrock <ip>`.
+  • Microsoft / Xbox auth tokens are cached in `auth-cache/`. Delete that
+    folder to force a new Microsoft login.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
