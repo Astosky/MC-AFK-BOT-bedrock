@@ -2,7 +2,7 @@
   "name": "mc-afk-bot",
   "version": "2.0.1",
   "private": true,
-  "description": "Minecraft Bedrock & Java AFK bot controlled via Discord",
+  "description": "Minecraft Bedrock & Java AFK bot — Made by Asto",
   "main": "src/index.js",
   "type": "module",
   "scripts": {

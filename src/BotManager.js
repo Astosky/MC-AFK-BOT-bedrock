@@ -1,5 +1,6 @@
-// Made by Ayliee, All rights are reserved to AeroX Development
+// Made by Asto
 
+import { isIP } from 'net';
 import { ActivityType } from 'discord.js';
 import { BedrockBot } from './BedrockBot.js';
 import { MinecraftBot } from './MinecraftBot.js';
@@ -26,6 +27,41 @@ function normUser(user = '') {
 
 function makeBotKey(edition, username, host) {
   return `${edition}:${normUser(username)}@${normHost(host)}`;
+}
+
+const GENERIC_SUBDOMAINS = new Set([
+  'play',
+  'mc',
+  'mco',
+  'bedrock',
+  'be',
+  'pe',
+  'java',
+  'je',
+  'join',
+  'server',
+  'hub',
+  'lobby',
+]);
+
+// Strip IPs and domain suffixes so Discord status only shows the clean server name
+// e.g. "RndmCraft.aternos.me" -> "RndmCraft", "play.randomcraft.net" -> "Randomcraft", "1.2.3.4" -> "Minecraft"
+export function formatServerDisplayName(host = '') {
+  const cleaned = String(host || '').trim().replace(/^\[|\]$/g, '');
+  if (!cleaned || cleaned.toLowerCase() === 'localhost' || isIP(cleaned) !== 0) {
+    return 'Minecraft';
+  }
+
+  const parts = cleaned.split('.').filter(Boolean);
+  if (parts.length === 0) return 'Minecraft';
+
+  let label = parts[0];
+  if (parts.length >= 3 && GENERIC_SUBDOMAINS.has(parts[0].toLowerCase())) {
+    label = parts[1];
+  }
+
+  if (!label || /^\d+$/.test(label)) return 'Minecraft';
+  return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
 export class BotManager {
@@ -428,19 +464,20 @@ export class BotManager {
     return { components: [c], flags: MessageFlags.IsComponentsV2 };
   }
 
-  // Build live Discord bot profile status
-  getPresenceData(defaultServer = null) {
+  // Build live Discord bot profile status (never exposes raw IPs or domain suffixes)
+  getPresenceData() {
     const allBots = [...this.bots.values()];
     const onlineBots = allBots.filter((b) => b.isOnline);
 
     if (onlineBots.length === 1) {
       const b = onlineBots[0];
       const name = b.realUsername || b.options.username;
+      const serverName = formatServerDisplayName(b.options.host);
       return {
         status: 'online',
         activities: [
           {
-            name: `${b.options.host} · ${name}`,
+            name: `${serverName} · ${name}`,
             type: ActivityType.Playing,
           },
         ],
@@ -448,8 +485,9 @@ export class BotManager {
     }
 
     if (onlineBots.length > 1) {
-      const hosts = [...new Set(onlineBots.map((b) => b.options.host))];
-      const hostSummary = hosts.length === 1 ? hosts[0] : `${hosts[0]} +${hosts.length - 1}`;
+      const serverNames = [...new Set(onlineBots.map((b) => formatServerDisplayName(b.options.host)))];
+      const hostSummary =
+        serverNames.length === 1 ? serverNames[0] : `${serverNames[0]} +${serverNames.length - 1}`;
       return {
         status: 'online',
         activities: [
@@ -463,35 +501,24 @@ export class BotManager {
 
     if (allBots.length > 0) {
       const b = allBots[0];
+      const serverName = formatServerDisplayName(b.options.host);
       return {
         status: 'idle',
         activities: [
           {
-            name: `Connecting to ${b.options.host}...`,
+            name: `Connecting to ${serverName}...`,
             type: ActivityType.Playing,
           },
         ],
       };
     }
 
-    if (defaultServer) {
-      return {
-        status: 'idle',
-        activities: [
-          {
-            name: `${defaultServer.host} · !join AFKBot`,
-            type: ActivityType.Watching,
-          },
-        ],
-      };
-    }
-
     return {
-      status: 'online',
+      status: 'idle',
       activities: [
         {
-          name: '!setserver · !help',
-          type: ActivityType.Watching,
+          name: 'Admiring Asto',
+          type: ActivityType.Custom,
         },
       ],
     };

@@ -80,7 +80,4 @@ This project is source-available. You may view, run, and privately modify the co
 
 ## Credits
 
-Developed by **aliyie**  
-Part of **AeroX Development**
-
-Join the community: [discord.gg/aerox](https://discord.gg/aerox)
+Made by **Asto**
