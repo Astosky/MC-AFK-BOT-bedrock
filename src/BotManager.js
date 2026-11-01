@@ -1,8 +1,20 @@
 // Made by Ayliee, All rights are reserved to AeroX Development
 
+import { ActivityType } from 'discord.js';
 import { BedrockBot } from './BedrockBot.js';
 import { MinecraftBot } from './MinecraftBot.js';
-import { msg, msgList } from './ui.js';
+import {
+  msg,
+  ContainerBuilder,
+  ButtonStyle,
+  MessageFlags,
+  thinDivider,
+  thinSpacer,
+  text,
+  button,
+  actionRow,
+  buildBotControlRow,
+} from './ui.js';
 
 function normHost(host = '') {
   return String(host).trim().toLowerCase();
@@ -17,9 +29,21 @@ function makeBotKey(edition, username, host) {
 }
 
 export class BotManager {
-  constructor() {
+  constructor({ onChange } = {}) {
     this.bots = new Map();
     this._authPasswords = new Map();
+    this._nextId = 1;
+    this.onChange = onChange || null;
+  }
+
+  _notifyChange() {
+    if (this.onChange) {
+      try { this.onChange(); } catch {}
+    }
+  }
+
+  _allocBotId() {
+    return `b${this._nextId++}`;
   }
 
   _getAuthPassword(username, host) {
@@ -37,21 +61,77 @@ export class BotManager {
     return new BedrockBot(options, channel, onFatal, onRealUsername, authPassword);
   }
 
+  getBotById(botId) {
+    for (const [key, bot] of this.bots.entries()) {
+      if (bot.botId === botId) return { key, bot };
+    }
+    return null;
+  }
+
+  hasBotOnHost(username, host) {
+    return Boolean(this._findBot(username, host));
+  }
+
+  _matchesUser(bot, u) {
+    return (
+      normUser(bot.realUsername) === u ||
+      normUser(bot.options.username) === u ||
+      normUser(bot.discordUserId) === u
+    );
+  }
+
   _findBot(username, host) {
     const h = normHost(host);
     const u = normUser(username);
 
     for (const [key, bot] of this.bots.entries()) {
       if (normHost(bot.options.host) !== h) continue;
-      if (
-        normUser(bot.realUsername) === u ||
-        normUser(bot.options.username) === u ||
-        normUser(bot.discordUserId) === u
-      ) {
+      if (this._matchesUser(bot, u)) {
         return { key, bot };
       }
     }
     return null;
+  }
+
+  // Flexible lookup supporting omitted server IP (checks defaultHost first, then sole match)
+  findBotFlexible(username, host, defaultHost = null) {
+    if (host) {
+      return { match: this._findBot(username, host), ambiguous: false };
+    }
+
+    if (!username) {
+      if (this.bots.size === 1) {
+        const [key, bot] = [...this.bots.entries()][0];
+        return { match: { key, bot }, ambiguous: false };
+      }
+      if (defaultHost) {
+        const onDefault = [...this.bots.entries()].filter(
+          ([, b]) => normHost(b.options.host) === normHost(defaultHost)
+        );
+        if (onDefault.length === 1) {
+          const [key, bot] = onDefault[0];
+          return { match: { key, bot }, ambiguous: false };
+        }
+      }
+      return { match: null, ambiguous: this.bots.size > 1 };
+    }
+
+    if (defaultHost) {
+      const onDefault = this._findBot(username, defaultHost);
+      if (onDefault) return { match: onDefault, ambiguous: false };
+    }
+
+    const u = normUser(username);
+    const matches = [];
+    for (const [key, bot] of this.bots.entries()) {
+      if (this._matchesUser(bot, u)) {
+        matches.push({ key, bot });
+      }
+    }
+
+    if (matches.length === 1) return { match: matches[0], ambiguous: false };
+    if (matches.length > 1) return { match: null, ambiguous: true };
+    return { match: null, ambiguous: false };
   }
 
   // Join a cracked / offline-mode server (Bedrock or Java)
@@ -66,6 +146,7 @@ export class BotManager {
 
     const authPassword = this._getAuthPassword(options.username, options.host);
     const editionLabel = edition === 'java' ? 'Java' : 'Bedrock';
+    const botId = this._allocBotId();
 
     channel
       .send(msg(`Connecting **${options.username}** to **${options.host}:${port}** (${editionLabel})...`))
@@ -74,9 +155,18 @@ export class BotManager {
     let currentKey = key;
     const bot = this._createBotInstance(
       edition,
-      { ...options, port, auth: 'offline' },
+      {
+        ...options,
+        port,
+        auth: 'offline',
+        botId,
+        onStateChange: () => this._notifyChange(),
+      },
       channel,
-      () => this.bots.delete(currentKey),
+      () => {
+        this.bots.delete(currentKey);
+        this._notifyChange();
+      },
       (realUsername) => {
         const nextKey = makeBotKey(edition, realUsername, options.host);
         if (nextKey !== currentKey) {
@@ -84,11 +174,13 @@ export class BotManager {
           currentKey = nextKey;
           this.bots.set(currentKey, bot);
         }
+        this._notifyChange();
       },
       authPassword
     );
 
     this.bots.set(currentKey, bot);
+    this._notifyChange();
     bot.connect().catch((err) => console.error('[BotManager] joinCracked connect error:', err));
   }
 
@@ -109,6 +201,8 @@ export class BotManager {
     }
 
     const editionLabel = edition === 'java' ? 'Java' : 'Bedrock';
+    const botId = this._allocBotId();
+
     channel
       .send(msg(`Starting Microsoft login for **${options.host}:${port}** (${editionLabel})...`))
       .catch(() => {});
@@ -117,70 +211,289 @@ export class BotManager {
 
     const bot = this._createBotInstance(
       edition,
-      { ...options, port, username: discordUserId, auth: 'microsoft' },
+      {
+        ...options,
+        port,
+        username: discordUserId,
+        auth: 'microsoft',
+        botId,
+        onStateChange: () => this._notifyChange(),
+      },
       channel,
-      () => this.bots.delete(currentKey),
+      () => {
+        this.bots.delete(currentKey);
+        this._notifyChange();
+      },
       (realUsername) => {
         this.bots.delete(currentKey);
         currentKey = makeBotKey(edition, realUsername, options.host);
         this.bots.set(currentKey, bot);
+        this._notifyChange();
       }
     );
 
     bot.discordUserId = discordUserId;
     this.bots.set(currentKey, bot);
+    this._notifyChange();
     bot.connect().catch((err) => console.error('[BotManager] joinPremium connect error:', err));
   }
 
-  removeBot(username, host, channel) {
-    const found = this._findBot(username, host);
-    if (found) {
-      const displayName = found.bot.realUsername || username;
-      found.bot.stop();
-      this.bots.delete(found.key);
-      return channel.send(msg(`**${displayName}** disconnected from **${host}**`));
-    }
-    return channel.send(msg(`no bot named **${username}** on **${host}**`));
+  removeByEntry(found) {
+    const displayName = found.bot.realUsername || found.bot.options.username;
+    const host = found.bot.options.host;
+    found.bot.stop();
+    this.bots.delete(found.key);
+    this._notifyChange();
+    return { displayName, host };
   }
 
-  jump(username, host, channel) {
-    const found = this._findBot(username, host);
-    if (found) {
-      found.bot.jump();
-      return;
+  removeBot(username, host, channel, defaultHost = null) {
+    const { match, ambiguous } = this.findBotFlexible(username, host, defaultHost);
+    if (match) {
+      const { displayName, host: targetHost } = this.removeByEntry(match);
+      return channel.send(msg(`**${displayName}** disconnected from **${targetHost}**`));
     }
-    channel.send(msg(`no bot named **${username}** on **${host}**`));
-  }
-
-  say(username, host, text, channel) {
-    const found = this._findBot(username, host);
-    if (found) {
-      found.bot.say(text);
-      return;
+    if (ambiguous) {
+      return channel.send(msg('Multiple bots active — specify `!leave <username>` or `!leave <ip> <username>` (or `!leave all`)'));
     }
-    channel.send(msg(`no bot named **${username}** on **${host}**`));
-  }
-
-  getStatus() {
     if (this.bots.size === 0) {
-      return msg('no active bots');
+      return channel.send(msg('no active bots to disconnect'));
+    }
+    const targetDesc = host ? ` on **${host}**` : '';
+    return channel.send(msg(`no bot named **${username}**${targetDesc}`));
+  }
+
+  removeAllBots(channel) {
+    if (this.bots.size === 0) {
+      return channel.send(msg('no active bots'));
+    }
+    const count = this.bots.size;
+    for (const bot of this.bots.values()) {
+      bot.stop();
+    }
+    this.bots.clear();
+    this._notifyChange();
+    return channel.send(msg(`Disconnected **${count}** bot${count === 1 ? '' : 's'}`));
+  }
+
+  jump(username, host, channel, defaultHost = null) {
+    const { match, ambiguous } = this.findBotFlexible(username, host, defaultHost);
+    if (match) {
+      match.bot.jump();
+      return;
+    }
+    if (ambiguous) {
+      channel.send(msg('Multiple bots active — specify `!jump <username>` or `!jump <ip> <username>`'));
+      return;
+    }
+    channel.send(msg(username ? `no bot named **${username}**` : 'no active bots'));
+  }
+
+  sneak(username, host, channel, defaultHost = null) {
+    const { match, ambiguous } = this.findBotFlexible(username, host, defaultHost);
+    if (match) {
+      match.bot.toggleSneak();
+      return;
+    }
+    if (ambiguous) {
+      channel.send(msg('Multiple bots active — specify `!sneak <username>` or `!sneak <ip> <username>`'));
+      return;
+    }
+    channel.send(msg(username ? `no bot named **${username}**` : 'no active bots'));
+  }
+
+  formatCoordsText(bot) {
+    const name = bot.realUsername || bot.options.username;
+    const coords = bot.getCoords?.();
+    const uptime = bot.getUptimeString?.();
+    const editionLabel =
+      bot.edition === 'java'
+        ? `Java${bot.serverVersion ? ` ${bot.serverVersion}` : ''}`
+        : `Bedrock${bot.serverVersion ? ` ${bot.serverVersion}` : ''}`;
+
+    if (!bot.isOnline || !coords) {
+      return `**${name}** — connecting to **${bot.options.host}:${bot.options.port}** (${editionLabel})`;
     }
 
-    const rows = [...this.bots.values()].map((bot) => {
+    const sneakTag = bot.isSneaking ? ' · sneaking' : '';
+    const upTag = uptime ? ` · uptime ${uptime}` : '';
+    return (
+      `**${name}** — \`X: ${coords.x}, Y: ${coords.y}, Z: ${coords.z}\`\n` +
+      `-# ${bot.options.host}:${bot.options.port} · ${editionLabel}${upTag}${sneakTag}`
+    );
+  }
+
+  coords(username, host, channel, defaultHost = null) {
+    const { match, ambiguous } = this.findBotFlexible(username, host, defaultHost);
+    if (match) {
+      return channel.send(msg(this.formatCoordsText(match.bot)));
+    }
+    if (ambiguous) {
+      return channel.send(msg('Multiple bots active — specify `!coords <username>` or `!coords <ip> <username>`'));
+    }
+    return channel.send(msg(username ? `no bot named **${username}**` : 'no active bots'));
+  }
+
+  say(username, host, chatText, channel, defaultHost = null) {
+    const { match, ambiguous } = this.findBotFlexible(username, host, defaultHost);
+    if (match) {
+      match.bot.say(chatText);
+      return;
+    }
+    if (ambiguous) {
+      channel.send(msg('Multiple bots active — specify `!say <username> <message>` or `!say <ip> <username> <message>`'));
+      return;
+    }
+    channel.send(msg(username ? `no bot named **${username}**` : 'no active bots'));
+  }
+
+  // Interactive Discord V2 status & control panel
+  getStatus(defaultServer = null) {
+    const c = new ContainerBuilder();
+
+    const defaultFooterLine = defaultServer
+      ? `Default server: **${defaultServer.host}:${defaultServer.port}** (${defaultServer.edition === 'java' ? 'Java' : 'Bedrock'})`
+      : 'Tip: set a default server with `!setserver <ip[:port]>`';
+
+    if (this.bots.size === 0) {
+      c.addTextDisplayComponents(
+        text(`**Active Bots**\n-# No bots currently running · ${defaultFooterLine}`)
+      );
+
+      if (defaultServer) {
+        c.addSeparatorComponents(thinDivider());
+        c.addActionRowComponents(
+          actionRow(
+            button('bot:quickjoin', 'Join AFKBot', ButtonStyle.Success),
+            button('bot:refresh', 'Refresh', ButtonStyle.Secondary)
+          )
+        );
+      }
+
+      return { components: [c], flags: MessageFlags.IsComponentsV2 };
+    }
+
+    c.addTextDisplayComponents(text('**Active Bots**'));
+    c.addSeparatorComponents(thinDivider());
+
+    const allBots = [...this.bots.values()];
+    const interactiveBots = allBots.slice(0, 4); // Reserve 1 row for bottom bar (Discord max 5 ActionRows)
+
+    allBots.forEach((bot, idx) => {
+      if (idx > 0) c.addSeparatorComponents(thinSpacer());
+
       const name = bot.realUsername || bot.options.username;
       const state = bot.isOnline ? 'online' : 'connecting';
       const editionLabel =
         bot.edition === 'java'
           ? `Java${bot.serverVersion ? ` ${bot.serverVersion}` : ''}`
           : `Bedrock${bot.serverVersion ? ` ${bot.serverVersion}` : ''}`;
-      return `**${name}** — ${bot.options.host}:${bot.options.port} (${editionLabel}) — ${state}`;
+
+      const coords = bot.getCoords?.();
+      const uptime = bot.getUptimeString?.();
+      const metaParts = [];
+      if (coords) metaParts.push(`XYZ: \`${coords.x}, ${coords.y}, ${coords.z}\``);
+      if (uptime) metaParts.push(`up ${uptime}`);
+      if (bot.isSneaking) metaParts.push('sneaking');
+
+      const metaLine = metaParts.length > 0 ? `\n-# ${metaParts.join(' · ')}` : '';
+      c.addTextDisplayComponents(
+        text(`**${name}** — ${bot.options.host}:${bot.options.port} (${editionLabel}) — **${state}**${metaLine}`)
+      );
+
+      if (idx < interactiveBots.length) {
+        c.addActionRowComponents(
+          buildBotControlRow(bot.botId, { isOnline: bot.isOnline, isSneaking: bot.isSneaking })
+        );
+      }
     });
 
-    const count = rows.length;
-    return msgList(
-      '**Active Bots**',
-      rows,
-      `-# ${count} bot${count === 1 ? '' : 's'} running`
+    c.addSeparatorComponents(thinDivider());
+    const onlineCount = allBots.filter((b) => b.isOnline).length;
+    c.addTextDisplayComponents(
+      text(
+        `-# ${onlineCount}/${allBots.length} online · ${defaultFooterLine}`
+      )
     );
+
+    const bottomButtons = [button('bot:refresh', 'Refresh', ButtonStyle.Secondary)];
+    if (defaultServer && !this.hasBotOnHost('AFKBot', defaultServer.host)) {
+      bottomButtons.unshift(button('bot:quickjoin', 'Join AFKBot', ButtonStyle.Success));
+    }
+    if (allBots.length > 1) {
+      bottomButtons.push(button('bot:leaveall', 'Leave All', ButtonStyle.Danger));
+    }
+    c.addActionRowComponents(actionRow(...bottomButtons));
+
+    return { components: [c], flags: MessageFlags.IsComponentsV2 };
+  }
+
+  // Build live Discord bot profile status
+  getPresenceData(defaultServer = null) {
+    const allBots = [...this.bots.values()];
+    const onlineBots = allBots.filter((b) => b.isOnline);
+
+    if (onlineBots.length === 1) {
+      const b = onlineBots[0];
+      const name = b.realUsername || b.options.username;
+      return {
+        status: 'online',
+        activities: [
+          {
+            name: `${b.options.host} · ${name}`,
+            type: ActivityType.Playing,
+          },
+        ],
+      };
+    }
+
+    if (onlineBots.length > 1) {
+      const hosts = [...new Set(onlineBots.map((b) => b.options.host))];
+      const hostSummary = hosts.length === 1 ? hosts[0] : `${hosts[0]} +${hosts.length - 1}`;
+      return {
+        status: 'online',
+        activities: [
+          {
+            name: `${hostSummary} · ${onlineBots.length} bots online`,
+            type: ActivityType.Playing,
+          },
+        ],
+      };
+    }
+
+    if (allBots.length > 0) {
+      const b = allBots[0];
+      return {
+        status: 'idle',
+        activities: [
+          {
+            name: `Connecting to ${b.options.host}...`,
+            type: ActivityType.Playing,
+          },
+        ],
+      };
+    }
+
+    if (defaultServer) {
+      return {
+        status: 'idle',
+        activities: [
+          {
+            name: `${defaultServer.host} · !join AFKBot`,
+            type: ActivityType.Watching,
+          },
+        ],
+      };
+    }
+
+    return {
+      status: 'online',
+      activities: [
+        {
+          name: '!setserver · !help',
+          type: ActivityType.Watching,
+        },
+      ],
+    };
   }
 }
