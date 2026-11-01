@@ -1,4 +1,4 @@
-// Made by Ayliee, All rights are reserved to AeroX Development
+// Made by Asto
 
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -11,7 +11,7 @@ import {
   MessageFlags,
   thinDivider,
   text,
-  buildBotControlRow,
+  buildBotCardRows,
   formatDuration,
 } from './ui.js';
 
@@ -19,15 +19,14 @@ const FATAL_CODES = new Set(['ENOTFOUND']);
 const MAX_RECONNECTS = 5;
 const RECONNECT_DELAY_MS = 15_000;
 const ANTI_AFK_INTERVAL_MS = 5_000;
+const TICK_INTERVAL_MS = 50;
 const MC_CHAT_LIMIT = 256;
+const PLAY_TETHER_RADIUS = 22;
 
-// Local auth cache stored next to the bot files — works in any environment
-// including headless servers and Pterodactyl containers (no Minecraft client needed)
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MS_CACHE_DIR = path.join(__dirname, '..', 'auth-cache');
 fs.mkdirSync(MS_CACHE_DIR, { recursive: true });
 
-// Auth-plugin prompt patterns (AuthMe, nLogin, FastLogin, etc.)
 const REGISTER_PATTERNS = [
   /\/register/i,
   /please register/i,
@@ -64,13 +63,6 @@ function parseKickReason(reason) {
 }
 
 export class MinecraftBot {
-  /**
-   * @param {object}   options          mineflayer createBot options (host, port, username, auth)
-   * @param {object}   discordChannel   Discord TextChannel to send status messages to
-   * @param {Function} onFatal          called when the bot permanently fails and is removed
-   * @param {Function} onRealUsername   called with the real MC username after first spawn
-   * @param {string}   [authPassword]   optional stable password injected by BotManager (cracked bots)
-   */
   constructor(options, discordChannel, onFatal, onRealUsername, authPassword) {
     this.edition = 'java';
     this.botId = options.botId || `b_${Math.random().toString(36).slice(2, 8)}`;
@@ -79,10 +71,13 @@ export class MinecraftBot {
     this.discordChannel = discordChannel;
     this.onFatal = onFatal;
     this.onRealUsername = onRealUsername;
+
     this.bot = null;
+    this.tickInterval = null;
     this.jumpInterval = null;
     this.lookInterval = null;
     this.reconnectTimeout = null;
+
     this.isStopping = false;
     this.isFatal = false;
     this.isDisconnecting = false;
@@ -94,6 +89,16 @@ export class MinecraftBot {
     this.serverVersion = null;
     this.lastErrorReason = null;
 
+    // Gameplay behavior state
+    this.mode = 'afk';
+    this.modeTarget = null;
+    this._playAnchor = null;
+    this._playAction = null;
+    this._circleCenter = null;
+    this._dancePhase = 0;
+    this._spinTicksRemaining = 0;
+    this._tickCounter = 0;
+
     this.authPassword = authPassword || (Math.random().toString(36).slice(2, 12) + 'Aa1!');
   }
 
@@ -101,12 +106,28 @@ export class MinecraftBot {
     return Boolean(this.bot?.entity);
   }
 
-  // Safely send a V2 container message to Discord; swallows channel errors
+  getModeLabel() {
+    switch (this.mode) {
+      case 'follow':
+        return `Following ${this.modeTarget || 'nearest'}`;
+      case 'come':
+        return `Going to ${this.modeTarget || 'nearest'}`;
+      case 'play':
+        return 'Playing around';
+      case 'look':
+        return `Watching ${this.modeTarget || 'nearby'}`;
+      case 'dance':
+        return 'Dancing';
+      case 'circle':
+        return `Orbiting ${this.modeTarget || 'spot'}`;
+      default:
+        return 'AFK';
+    }
+  }
+
   send(content) {
     this.discordChannel.send(content).catch(() => {});
   }
-
-  // ─── Microsoft pre-authentication ────────────────────────────────────────────
 
   async _preAuth() {
     try {
@@ -120,8 +141,8 @@ export class MinecraftBot {
       };
 
       const flow = new Authflow(
-        this.options.username,  // Discord user ID — stable unique cache key
-        MS_CACHE_DIR,           // Shared cache directory passed to mineflayer as profilesFolder
+        this.options.username,
+        MS_CACHE_DIR,
         authOptions,
         (data) => {
           const mins = Math.floor((data.expires_in || 900) / 60);
@@ -148,8 +169,6 @@ export class MinecraftBot {
       return false;
     }
   }
-
-  // ─── Connection ───────────────────────────────────────────────────────────────
 
   async connect() {
     if (this.isStopping || this.isFatal) return;
@@ -196,6 +215,9 @@ export class MinecraftBot {
       if (this.isSneaking && this.bot?.entity) {
         this.bot.setControlState('sneak', true);
       }
+      if (this.mode === 'play' && !this._playAnchor && this.bot?.entity) {
+        this._playAnchor = this.bot.entity.position.clone();
+      }
 
       if (!this.spawnedOnce && this.onRealUsername) {
         this.spawnedOnce = true;
@@ -207,18 +229,24 @@ export class MinecraftBot {
       const verTag = this.serverVersion ? `Java ${this.serverVersion}` : 'Java';
       const c = new ContainerBuilder();
       c.addTextDisplayComponents(
-        text(`**${name}** connected to **${this.options.host}:${this.options.port}**\n-# ${verTag}`)
+        text(
+          `**${name}** connected to **${this.options.host}:${this.options.port}**\n` +
+          `-# ${verTag} · Mode: ${this.getModeLabel()}`
+        )
       );
       c.addSeparatorComponents(thinDivider());
       c.addActionRowComponents(
-        buildBotControlRow(this.botId, { isOnline: true, isSneaking: this.isSneaking })
+        ...buildBotCardRows(this.botId, {
+          isOnline: true,
+          isSneaking: this.isSneaking,
+          mode: this.mode,
+        })
       );
 
       this.send({ components: [c], flags: MessageFlags.IsComponentsV2 });
       this.startAntiAfk();
     });
 
-    // Intercept all server chat — catches AuthMe, nLogin, FastLogin prompts
     this.bot.on('messagestr', (raw) => {
       if (!this.bot || this.isStopping) return;
       const t = raw.toLowerCase();
@@ -241,7 +269,6 @@ export class MinecraftBot {
       }
     });
 
-    // Chat relay — plain text to avoid rate-limiting on high-traffic servers
     this.bot.on('chat', (username, chatMessage) => {
       if (!this.bot || username === this.bot.username) return;
       this.discordChannel
@@ -320,20 +347,219 @@ export class MinecraftBot {
     this.reconnectTimeout = setTimeout(() => this.connect().catch(() => {}), RECONNECT_DELAY_MS);
   }
 
+  // ─── Target Lookup & Behavior Loop ───────────────────────────────────────────
+
+  _findNearbyPlayer(query = null) {
+    if (!this.bot?.entity) return null;
+    const selfPos = this.bot.entity.position;
+    const selfName = (this.bot.username || '').toLowerCase();
+
+    const visible = Object.values(this.bot.players || {})
+      .filter((p) => p?.entity && p.username && p.username.toLowerCase() !== selfName);
+
+    if (!query) {
+      if (visible.length === 0) return null;
+      visible.sort((a, b) => a.entity.position.distanceTo(selfPos) - b.entity.position.distanceTo(selfPos));
+      return visible[0];
+    }
+
+    const q = String(query).trim().toLowerCase();
+    return (
+      visible.find((p) => p.username.toLowerCase() === q) ||
+      visible.find((p) => p.username.toLowerCase().startsWith(q)) ||
+      visible.find((p) => p.username.toLowerCase().includes(q)) ||
+      null
+    );
+  }
+
+  _findOnlinePlayerName(query) {
+    if (!query || !this.bot?.players) return null;
+    const selfName = (this.bot.username || '').toLowerCase();
+    const q = String(query).trim().toLowerCase();
+    const names = Object.keys(this.bot.players).filter((n) => n.toLowerCase() !== selfName);
+    return (
+      names.find((n) => n.toLowerCase() === q) ||
+      names.find((n) => n.toLowerCase().startsWith(q)) ||
+      names.find((n) => n.toLowerCase().includes(q)) ||
+      null
+    );
+  }
+
+  _clearControls() {
+    if (!this.bot) return;
+    for (const ctrl of ['forward', 'back', 'left', 'right', 'sprint', 'jump']) {
+      try { this.bot.setControlState(ctrl, false); } catch {}
+    }
+    if (this.mode === 'dance' || this.mode === 'play') {
+      this.isSneaking = false;
+      try { this.bot.setControlState('sneak', false); } catch {}
+    }
+  }
+
+  _pulseJump() {
+    if (!this.bot?.entity) return;
+    this.bot.setControlState('jump', true);
+    setTimeout(() => { if (this.bot) this.bot.setControlState('jump', false); }, 300);
+  }
+
+  _pickNextPlayAction() {
+    const now = Date.now();
+    const pos = this.bot.entity.position;
+    const anchor = this._playAnchor || pos;
+    const distFromAnchor = Math.hypot(pos.x - anchor.x, pos.z - anchor.z);
+
+    const yaw =
+      distFromAnchor > PLAY_TETHER_RADIUS
+        ? Math.atan2(-(anchor.x - pos.x), -(anchor.z - pos.z)) + (Math.random() - 0.5) * 0.8
+        : Math.random() * Math.PI * 2 - Math.PI;
+
+    const roll = Math.random();
+    if (roll < 0.45) {
+      return { kind: 'sprint_hop', yaw, pitch: 0, expiresAt: now + 2000 + Math.random() * 2200, ticks: 0 };
+    }
+    if (roll < 0.72) {
+      return { kind: 'stroll', yaw, pitch: -0.3, expiresAt: now + 2000 + Math.random() * 2000, ticks: 0 };
+    }
+    if (roll < 0.88) {
+      return { kind: 'strafe', dir: Math.random() < 0.5 ? 'left' : 'right', expiresAt: now + 1500 + Math.random() * 1400, ticks: 0 };
+    }
+    return { kind: 'breather', yaw, pitch: (Math.random() - 0.5) * 0.5, expiresAt: now + 1500 + Math.random() * 1500, ticks: 0 };
+  }
+
+  _updateBehaviorTick() {
+    if (!this.bot?.entity || this.isStopping) return;
+    this._tickCounter++;
+
+    if (this._spinTicksRemaining > 0) {
+      const nextYaw = this.bot.entity.yaw + (Math.PI * 2) / 12;
+      this.bot.look(nextYaw, 0, true);
+      if (this._spinTicksRemaining === 6) this.bot.swingArm('right');
+      this._spinTicksRemaining--;
+      return;
+    }
+
+    if (this.mode === 'afk') return;
+
+    const selfPos = this.bot.entity.position;
+
+    if (this.mode === 'look') {
+      const target = this._findNearbyPlayer(this.modeTarget);
+      if (target?.entity) {
+        this.bot.lookAt(target.entity.position.offset(0, 1.6, 0), true);
+      }
+      return;
+    }
+
+    if (this.mode === 'follow' || this.mode === 'come') {
+      const target = this._findNearbyPlayer(this.modeTarget);
+      if (!target?.entity) {
+        this._clearControls();
+        return;
+      }
+
+      if (!this.modeTarget) this.modeTarget = target.username;
+      const tPos = target.entity.position;
+      this.bot.lookAt(tPos.offset(0, 1.6, 0), true);
+      const dist = Math.hypot(tPos.x - selfPos.x, tPos.z - selfPos.z);
+
+      if (this.mode === 'come' && dist <= 2.4) {
+        const reachedName = target.username;
+        const selfName = this.realUsername || this.options.username;
+        this.bot.swingArm('right');
+        this.stopActivity({ silent: true });
+        this.send(msg(`**${selfName}** arrived at **${reachedName}**`));
+        return;
+      }
+
+      if (dist > 6.0) {
+        this.bot.setControlState('forward', true);
+        this.bot.setControlState('back', false);
+        this.bot.setControlState('sprint', true);
+        this.bot.setControlState('jump', Boolean(this.bot.entity.isCollidedHorizontally));
+      } else if (dist > 2.4) {
+        this.bot.setControlState('forward', true);
+        this.bot.setControlState('back', false);
+        this.bot.setControlState('sprint', false);
+        this.bot.setControlState('jump', Boolean(this.bot.entity.isCollidedHorizontally));
+      } else if (dist < 1.3) {
+        this.bot.setControlState('forward', false);
+        this.bot.setControlState('back', true);
+        this.bot.setControlState('sprint', false);
+        this.bot.setControlState('jump', false);
+      } else {
+        this.bot.setControlState('forward', false);
+        this.bot.setControlState('back', false);
+        this.bot.setControlState('sprint', false);
+        this.bot.setControlState('jump', false);
+      }
+      return;
+    }
+
+    if (this.mode === 'dance') {
+      this._dancePhase++;
+      this.bot.look(this.bot.entity.yaw + 0.28, Math.sin(this._dancePhase * 0.4) * 0.5, true);
+      if (this._dancePhase % 5 === 0) {
+        this.isSneaking = !this.isSneaking;
+        this.bot.setControlState('sneak', this.isSneaking);
+      }
+      if (this._dancePhase % 16 === 0) this._pulseJump();
+      if (this._dancePhase % 9 === 0) this.bot.swingArm('right');
+      return;
+    }
+
+    if (this.mode === 'circle') {
+      const target = this.modeTarget ? this._findNearbyPlayer(this.modeTarget) : this._findNearbyPlayer(null);
+      const center = target?.entity ? target.entity.position : (this._circleCenter || selfPos);
+      this.bot.lookAt(center.offset(0, 1.5, 0), true);
+      const dist = Math.hypot(center.x - selfPos.x, center.z - selfPos.z);
+      this.bot.setControlState('left', true);
+      this.bot.setControlState('forward', dist > 3.4);
+      this.bot.setControlState('back', dist < 2.5);
+      this.bot.setControlState('jump', Boolean(this.bot.entity.isCollidedHorizontally));
+      return;
+    }
+
+    if (this.mode === 'play') {
+      if (!this._playAnchor) this._playAnchor = selfPos.clone();
+      if (!this._playAction || Date.now() >= this._playAction.expiresAt) {
+        this._clearControls();
+        this._playAction = this._pickNextPlayAction();
+      }
+      const act = this._playAction;
+      act.ticks++;
+
+      if (act.kind === 'sprint_hop') {
+        this.bot.look(act.yaw, act.pitch, true);
+        this.bot.setControlState('forward', true);
+        this.bot.setControlState('sprint', true);
+        if (act.ticks % 13 === 1 || this.bot.entity.isCollidedHorizontally) this._pulseJump();
+      } else if (act.kind === 'stroll') {
+        this.bot.look(act.yaw, act.pitch, true);
+        this.bot.setControlState('forward', act.ticks < 28);
+        this.bot.setControlState('jump', Boolean(this.bot.entity.isCollidedHorizontally));
+        if (act.ticks === 25) this.bot.swingArm('right');
+      } else if (act.kind === 'strafe') {
+        this.bot.setControlState(act.dir, true);
+        if (act.ticks === 12) this.bot.swingArm('right');
+      } else {
+        this.bot.look(act.yaw, act.pitch, false);
+      }
+    }
+  }
+
   startAntiAfk() {
     this.stopAntiAfk();
 
-    // Jump every 5 seconds to prevent AFK kick
+    this.tickInterval = setInterval(() => this._updateBehaviorTick(), TICK_INTERVAL_MS);
+
     this.jumpInterval = setInterval(() => {
-      if (this.bot?.entity) {
-        this.bot.setControlState('jump', true);
-        setTimeout(() => { if (this.bot) this.bot.setControlState('jump', false); }, 400);
+      if (this.bot?.entity && (this.mode === 'afk' || this.mode === 'look')) {
+        this._pulseJump();
       }
     }, ANTI_AFK_INTERVAL_MS);
 
-    // Rotate view every 30 seconds to simulate an active player
     this.lookInterval = setInterval(() => {
-      if (this.bot?.entity) {
+      if (this.bot?.entity && this.mode === 'afk') {
         const yaw = Math.random() * Math.PI * 2 - Math.PI;
         const pitch = (Math.random() - 0.5) * 1.0;
         this.bot.look(yaw, pitch, false);
@@ -342,8 +568,243 @@ export class MinecraftBot {
   }
 
   stopAntiAfk() {
+    if (this.tickInterval) { clearInterval(this.tickInterval); this.tickInterval = null; }
     if (this.jumpInterval) { clearInterval(this.jumpInterval); this.jumpInterval = null; }
     if (this.lookInterval) { clearInterval(this.lookInterval); this.lookInterval = null; }
+  }
+
+  // ─── Commands & Fun Gameplay Modes ───────────────────────────────────────────
+
+  stopActivity({ silent = false } = {}) {
+    const name = this.realUsername || this.options.username;
+    this._clearControls();
+    this.mode = 'afk';
+    this.modeTarget = null;
+    this._playAnchor = null;
+    this._playAction = null;
+    this._circleCenter = null;
+    if (this.onStateChange) this.onStateChange();
+    const m = `**${name}** returned to **AFK** mode`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, mode: this.mode, message: m };
+  }
+
+  follow(playerQuery = null, { silent = false } = {}) {
+    const name = this.realUsername || this.options.username;
+    if (!this.bot?.entity) {
+      const m = `**${name}** — not in-game yet`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, message: m };
+    }
+
+    if (!playerQuery && this.mode === 'follow') {
+      return this.stopActivity({ silent });
+    }
+
+    this._clearControls();
+    const nearby = this._findNearbyPlayer(playerQuery);
+    if (nearby?.entity) {
+      this.mode = 'follow';
+      this.modeTarget = nearby.username;
+      const dist = nearby.entity.position.distanceTo(this.bot.entity.position).toFixed(1);
+      if (this.onStateChange) this.onStateChange();
+      const m = `**${name}** is now following **${nearby.username}** (${dist}m away)`;
+      if (!silent) this.send(msg(m));
+      return { ok: true, mode: this.mode, message: m };
+    }
+
+    if (playerQuery) {
+      const onlineMatch = this._findOnlinePlayerName(playerQuery) || playerQuery;
+      this.mode = 'follow';
+      this.modeTarget = onlineMatch;
+      if (this.onStateChange) this.onStateChange();
+      const m = `**${name}** is watching for **${onlineMatch}** and will follow as soon as they're in range`;
+      if (!silent) this.send(msg(m));
+      return { ok: true, mode: this.mode, message: m };
+    }
+
+    const m = `**${name}** — no nearby players in render distance right now`;
+    if (!silent) this.send(msg(m));
+    return { ok: false, message: m };
+  }
+
+  come(playerQuery = null, { silent = false } = {}) {
+    const name = this.realUsername || this.options.username;
+    if (!this.bot?.entity) {
+      const m = `**${name}** — not in-game yet`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, message: m };
+    }
+
+    const nearby = this._findNearbyPlayer(playerQuery);
+    if (!nearby?.entity) {
+      const targetDesc = playerQuery ? `**${playerQuery}**` : 'any player';
+      const m = `**${name}** — can't see ${targetDesc} in render distance right now`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, message: m };
+    }
+
+    this._clearControls();
+    this.mode = 'come';
+    this.modeTarget = nearby.username;
+    const dist = nearby.entity.position.distanceTo(this.bot.entity.position).toFixed(1);
+    if (this.onStateChange) this.onStateChange();
+    const m = `**${name}** is heading over to **${nearby.username}** (${dist}m away)`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, mode: this.mode, message: m };
+  }
+
+  togglePlay({ silent = false, forceOn = false } = {}) {
+    const name = this.realUsername || this.options.username;
+    if (!this.bot?.entity) {
+      const m = `**${name}** — not in-game yet`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, message: m };
+    }
+
+    if (this.mode === 'play' && !forceOn) {
+      return this.stopActivity({ silent });
+    }
+
+    this._clearControls();
+    this.mode = 'play';
+    this.modeTarget = null;
+    this._playAnchor = this.bot.entity.position.clone();
+    this._playAction = this._pickNextPlayAction();
+    if (this.onStateChange) this.onStateChange();
+    const m = `**${name}** started **Play Mode** — roaming around, sprint-jumping & exploring!`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, mode: this.mode, message: m };
+  }
+
+  lookAtPlayer(playerQuery = null, { silent = false } = {}) {
+    const name = this.realUsername || this.options.username;
+    if (!this.bot?.entity) {
+      const m = `**${name}** — not in-game yet`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, message: m };
+    }
+
+    this._clearControls();
+    const nearby = this._findNearbyPlayer(playerQuery);
+    this.mode = 'look';
+    this.modeTarget = nearby ? nearby.username : playerQuery || null;
+    if (this.onStateChange) this.onStateChange();
+    const label = this.modeTarget ? `**${this.modeTarget}**` : 'nearby players';
+    const m = `**${name}** is now watching ${label}`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, mode: this.mode, message: m };
+  }
+
+  toggleDance({ silent = false, forceOn = false } = {}) {
+    const name = this.realUsername || this.options.username;
+    if (!this.bot?.entity) {
+      const m = `**${name}** — not in-game yet`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, message: m };
+    }
+
+    if (this.mode === 'dance' && !forceOn) {
+      return this.stopActivity({ silent });
+    }
+
+    this._clearControls();
+    this.mode = 'dance';
+    this.modeTarget = null;
+    this._dancePhase = 0;
+    if (this.onStateChange) this.onStateChange();
+    const m = `**${name}** started **dancing**!`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, mode: this.mode, message: m };
+  }
+
+  circle(playerQuery = null, { silent = false } = {}) {
+    const name = this.realUsername || this.options.username;
+    if (!this.bot?.entity) {
+      const m = `**${name}** — not in-game yet`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, message: m };
+    }
+
+    this._clearControls();
+    const nearby = this._findNearbyPlayer(playerQuery);
+    this.mode = 'circle';
+    this.modeTarget = nearby ? nearby.username : playerQuery || null;
+    this._circleCenter = nearby?.entity ? nearby.entity.position.clone() : this.bot.entity.position.clone();
+    if (this.onStateChange) this.onStateChange();
+    const label = this.modeTarget ? `**${this.modeTarget}**` : 'their spot';
+    const m = `**${name}** is now orbiting around ${label}`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, mode: this.mode, message: m };
+  }
+
+  hit(playerQuery = null, { silent = false } = {}) {
+    const name = this.realUsername || this.options.username;
+    if (!this.bot?.entity) {
+      const m = `**${name}** — not in-game yet`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, message: m };
+    }
+
+    const nearby = this._findNearbyPlayer(playerQuery);
+    if (nearby?.entity) {
+      const dist = nearby.entity.position.distanceTo(this.bot.entity.position);
+      this.bot.lookAt(nearby.entity.position.offset(0, 1.5, 0), true);
+      if (dist <= 4.2) {
+        this.bot.attack(nearby.entity);
+        const m = `**${name}** punched **${nearby.username}**`;
+        if (!silent) this.send(msg(m));
+        return { ok: true, message: m };
+      }
+      this.bot.swingArm('right');
+      const m = `**${name}** waved at **${nearby.username}** (${dist.toFixed(1)}m away)`;
+      if (!silent) this.send(msg(m));
+      return { ok: true, message: m };
+    }
+
+    this.bot.swingArm('right');
+    const m = `**${name}** waved / swung their arm`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, message: m };
+  }
+
+  spin({ silent = false } = {}) {
+    const name = this.realUsername || this.options.username;
+    if (!this.bot?.entity) {
+      const m = `**${name}** — not in-game yet`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, message: m };
+    }
+    this._pulseJump();
+    this._spinTicksRemaining = 12;
+    const m = `**${name}** did a 360° spin!`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, message: m };
+  }
+
+  getPlayersInfo() {
+    if (!this.bot?.entity) return { nearby: [], farOnline: [] };
+    const selfPos = this.bot.entity.position;
+    const selfName = (this.bot.username || '').toLowerCase();
+
+    const nearby = [];
+    const farOnline = [];
+    for (const p of Object.values(this.bot.players || {})) {
+      if (!p?.username || p.username.toLowerCase() === selfName) continue;
+      if (p.entity) {
+        nearby.push({
+          username: p.username,
+          distance: Number(p.entity.position.distanceTo(selfPos).toFixed(1)),
+          x: Math.round(p.entity.position.x),
+          y: Math.round(p.entity.position.y),
+          z: Math.round(p.entity.position.z),
+        });
+      } else {
+        farOnline.push(p.username);
+      }
+    }
+    nearby.sort((a, b) => a.distance - b.distance);
+    return { nearby, farOnline };
   }
 
   getCoords() {
@@ -368,8 +829,7 @@ export class MinecraftBot {
       if (!silent) this.send(msg(m));
       return { ok: false, message: m };
     }
-    this.bot.setControlState('jump', true);
-    setTimeout(() => { if (this.bot) this.bot.setControlState('jump', false); }, 400);
+    this._pulseJump();
     const m = `**${name}** jumped`;
     if (!silent) this.send(msg(m));
     return { ok: true, message: m };
