@@ -1,4 +1,4 @@
-// Made by Ayliee, All rights are reserved to AeroX Development
+// Made by Asto
 
 import 'dotenv/config';
 import { Client, GatewayIntentBits, Partials } from 'discord.js';
@@ -18,7 +18,6 @@ import {
   parseServerAddress,
   looksLikeServerAddress,
   getDefaultServer,
-  getAnyDefaultServer,
   setDefaultServer,
   clearDefaultServer,
 } from './serverConfig.js';
@@ -43,14 +42,27 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
+const BOT_BIO = 'Made by Asto';
+
 function syncDiscordPresence() {
   if (!client.user) return;
   try {
-    const defaultSrv = getDefaultServer(GUILD_ID) || getAnyDefaultServer();
-    const presence = botManager.getPresenceData(defaultSrv);
+    const presence = botManager.getPresenceData();
     client.user.setPresence(presence);
   } catch {
     // Ignore transient gateway state errors
+  }
+}
+
+async function syncBotApplicationBio() {
+  try {
+    if (!client.application) return;
+    await client.application.fetch();
+    if (client.application.description !== BOT_BIO) {
+      await client.application.edit({ description: BOT_BIO });
+    }
+  } catch {
+    // Ignore if application bio is managed externally
   }
 }
 
@@ -65,6 +77,7 @@ client.on('clientReady', () => {
     console.log(`Discord bot logged in as ${client.user.tag} — active in all servers`);
   }
   syncDiscordPresence();
+  syncBotApplicationBio();
   // Refresh presence periodically in case of Discord gateway reconnects
   setInterval(syncDiscordPresence, 60_000).unref?.();
 });
@@ -119,7 +132,7 @@ function buildHelp(defaultServer) {
   c.addSeparatorComponents(thinDivider());
 
   c.addTextDisplayComponents(
-    text('**Made by:** Ayliee  ·  AeroX Development')
+    text('**Made by Asto**')
   );
 
   return { components: [c], flags: MessageFlags.IsComponentsV2 };
