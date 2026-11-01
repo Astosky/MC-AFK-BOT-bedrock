@@ -1,4 +1,4 @@
-// Made by Ayliee, All rights are reserved to AeroX Development
+// Made by Asto
 
 import {
   ContainerBuilder,
@@ -55,9 +55,74 @@ export function msgWithButtons(content, ...buttons) {
   return { components: [c], flags: FLAGS };
 }
 
-// Build standard quick-control button row for a single bot instance
-export function buildBotControlRow(botId, { isOnline = true, isSneaking = false } = {}) {
+// Compact 5-button row for !bots multi-bot panel (max 5 buttons per row)
+export function buildBotControlRow(
+  botId,
+  { isOnline = true, isSneaking = false, mode = 'afk' } = {}
+) {
+  const isPlaying = mode === 'play';
+  const isFollowing = mode === 'follow';
   return actionRow(
+    button(
+      `bot:play:${botId}`,
+      isPlaying ? 'Play: ON' : 'Play',
+      isPlaying ? ButtonStyle.Success : ButtonStyle.Secondary,
+      !isOnline
+    ),
+    button(
+      `bot:follow:${botId}`,
+      isFollowing ? 'Follow: ON' : 'Follow',
+      isFollowing ? ButtonStyle.Success : ButtonStyle.Secondary,
+      !isOnline
+    ),
+    button(`bot:jump:${botId}`, 'Jump', ButtonStyle.Secondary, !isOnline),
+    button(
+      `bot:sneak:${botId}`,
+      isSneaking ? 'Sneak: ON' : 'Sneak',
+      isSneaking ? ButtonStyle.Success : ButtonStyle.Secondary,
+      !isOnline
+    ),
+    button(`bot:leave:${botId}`, 'Leave', ButtonStyle.Danger, false)
+  );
+}
+
+// Two rich control rows for a single connected bot card (Modes + Quick Actions)
+export function buildBotCardRows(
+  botId,
+  { isOnline = true, isSneaking = false, mode = 'afk' } = {}
+) {
+  const isPlaying = mode === 'play';
+  const isFollowing = mode === 'follow';
+  const isDancing = mode === 'dance';
+
+  const modeRow = actionRow(
+    button(
+      `bot:play:${botId}`,
+      isPlaying ? 'Play: ON' : 'Play Mode',
+      isPlaying ? ButtonStyle.Success : ButtonStyle.Primary,
+      !isOnline
+    ),
+    button(
+      `bot:follow:${botId}`,
+      isFollowing ? 'Following' : 'Follow Nearest',
+      isFollowing ? ButtonStyle.Success : ButtonStyle.Secondary,
+      !isOnline
+    ),
+    button(
+      `bot:dance:${botId}`,
+      isDancing ? 'Dancing' : 'Dance',
+      isDancing ? ButtonStyle.Success : ButtonStyle.Secondary,
+      !isOnline
+    ),
+    button(
+      `bot:stop:${botId}`,
+      'AFK / Stop',
+      ButtonStyle.Secondary,
+      !isOnline || mode === 'afk'
+    )
+  );
+
+  const actionRowBar = actionRow(
     button(`bot:jump:${botId}`, 'Jump', ButtonStyle.Secondary, !isOnline),
     button(
       `bot:sneak:${botId}`,
@@ -65,9 +130,12 @@ export function buildBotControlRow(botId, { isOnline = true, isSneaking = false 
       isSneaking ? ButtonStyle.Success : ButtonStyle.Secondary,
       !isOnline
     ),
+    button(`bot:hit:${botId}`, 'Wave / Hit', ButtonStyle.Secondary, !isOnline),
     button(`bot:coords:${botId}`, 'Coords', ButtonStyle.Primary, !isOnline),
     button(`bot:leave:${botId}`, 'Leave', ButtonStyle.Danger, false)
   );
+
+  return [modeRow, actionRowBar];
 }
 
 // Multiple text sections split by thin dividers

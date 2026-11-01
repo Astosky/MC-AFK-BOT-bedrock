@@ -26,11 +26,19 @@ Save your server once with `!setserver`, and you can use short commands without 
 | `!setserver [bedrock\|java] <ip[:port]>` | Save your default server (persists across restarts; `!setserver clear` to reset) |
 | `!join [username]` | Join your default server (or `!join [bedrock\|java] <ip[:port]> [username]`) |
 | `!premjoin` | Join via Microsoft / Xbox account (or `!premjoin [bedrock\|java] <ip[:port]>`) |
-| `!bots` | Interactive status & button control panel (**Jump**, **Sneak**, **Coords**, **Leave**) |
-| `!say [username] <message>` | Send chat or a `/command` in-game (also supports `!say <ip> <username> <msg>`) |
-| `!jump [username]` | Manually trigger a jump |
-| `!sneak [username]` | Toggle crouch / sneak on or off |
-| `!coords [username]` | Show live `X / Y / Z` coordinates & uptime |
+| `!bots` | Interactive status & button control panel (**Play**, **Follow**, **Jump**, **Sneak**, **Leave**) |
+| `!players` | List online & nearby players with live distances |
+| `!play` | Autonomous **Play Mode** — roam around, sprint-jump, inspect blocks & greet nearby players |
+| `!follow [player]` | Follow a player (or nearest player if omitted) |
+| `!come [player]` | Walk/sprint over to a player and stop beside them |
+| `!look [player]` | Stand still and track a player with head & eyes |
+| `!circle [player]` | Circle-strafe / orbit around a player |
+| `!dance` | Party dance — crouch-beat, spin, jump & wave |
+| `!hit [player]` | Punch a nearby player/mob or wave arm |
+| `!spin` | Do a 360° jump spin |
+| `!stop` | Stop following / playing / dancing and return to standard AFK mode |
+| `!say [username] <message>` | Send chat or a `/command` in-game |
+| `!jump` / `!sneak` / `!coords` | Jump, toggle crouch, or check live `X / Y / Z` coordinates & uptime |
 | `!leave [username \| all]` | Disconnect a bot or all active bots |
 | `!help` | Show the command list |
 

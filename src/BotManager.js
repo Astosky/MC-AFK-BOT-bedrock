@@ -6,6 +6,7 @@ import { BedrockBot } from './BedrockBot.js';
 import { MinecraftBot } from './MinecraftBot.js';
 import {
   msg,
+  msgList,
   ContainerBuilder,
   ButtonStyle,
   MessageFlags,
@@ -312,36 +313,103 @@ export class BotManager {
     return channel.send(msg(`Disconnected **${count}** bot${count === 1 ? '' : 's'}`));
   }
 
-  jump(username, host, channel, defaultHost = null) {
+  _runBotAction(username, host, defaultHost, channel, cmdName, fn) {
     const { match, ambiguous } = this.findBotFlexible(username, host, defaultHost);
     if (match) {
-      match.bot.jump();
-      return;
+      return fn(match.bot);
     }
     if (ambiguous) {
-      channel.send(msg('Multiple bots active — specify `!jump <username>` or `!jump <ip> <username>`'));
-      return;
+      return channel.send(msg(`Multiple bots active — specify \`!${cmdName} <botName>\``));
     }
-    channel.send(msg(username ? `no bot named **${username}**` : 'no active bots'));
+    return channel.send(msg(username ? `no bot named **${username}**` : 'no active bots'));
+  }
+
+  jump(username, host, channel, defaultHost = null) {
+    return this._runBotAction(username, host, defaultHost, channel, 'jump', (b) => b.jump());
   }
 
   sneak(username, host, channel, defaultHost = null) {
-    const { match, ambiguous } = this.findBotFlexible(username, host, defaultHost);
-    if (match) {
-      match.bot.toggleSneak();
-      return;
-    }
-    if (ambiguous) {
-      channel.send(msg('Multiple bots active — specify `!sneak <username>` or `!sneak <ip> <username>`'));
-      return;
-    }
-    channel.send(msg(username ? `no bot named **${username}**` : 'no active bots'));
+    return this._runBotAction(username, host, defaultHost, channel, 'sneak', (b) => b.toggleSneak());
+  }
+
+  play(username, host, modeArg, channel, defaultHost = null) {
+    return this._runBotAction(username, host, defaultHost, channel, 'play', (b) => {
+      if (modeArg && ['off', 'stop', 'afk'].includes(modeArg.toLowerCase())) {
+        return b.stopActivity();
+      }
+      return b.togglePlay({ forceOn: Boolean(modeArg && modeArg.toLowerCase() === 'on') });
+    });
+  }
+
+  dance(username, host, modeArg, channel, defaultHost = null) {
+    return this._runBotAction(username, host, defaultHost, channel, 'dance', (b) => {
+      if (modeArg && ['off', 'stop', 'afk'].includes(modeArg.toLowerCase())) {
+        return b.stopActivity();
+      }
+      return b.toggleDance({ forceOn: Boolean(modeArg && modeArg.toLowerCase() === 'on') });
+    });
+  }
+
+  stopActivity(username, host, channel, defaultHost = null) {
+    return this._runBotAction(username, host, defaultHost, channel, 'stop', (b) => b.stopActivity());
+  }
+
+  spin(username, host, channel, defaultHost = null) {
+    return this._runBotAction(username, host, defaultHost, channel, 'spin', (b) => b.spin());
+  }
+
+  follow(username, host, targetPlayer, channel, defaultHost = null) {
+    return this._runBotAction(username, host, defaultHost, channel, 'follow', (b) => b.follow(targetPlayer));
+  }
+
+  come(username, host, targetPlayer, channel, defaultHost = null) {
+    return this._runBotAction(username, host, defaultHost, channel, 'come', (b) => b.come(targetPlayer));
+  }
+
+  look(username, host, targetPlayer, channel, defaultHost = null) {
+    return this._runBotAction(username, host, defaultHost, channel, 'look', (b) => b.lookAtPlayer(targetPlayer));
+  }
+
+  circle(username, host, targetPlayer, channel, defaultHost = null) {
+    return this._runBotAction(username, host, defaultHost, channel, 'circle', (b) => b.circle(targetPlayer));
+  }
+
+  hit(username, host, targetPlayer, channel, defaultHost = null) {
+    return this._runBotAction(username, host, defaultHost, channel, 'hit', (b) => b.hit(targetPlayer));
+  }
+
+  players(username, host, channel, defaultHost = null) {
+    return this._runBotAction(username, host, defaultHost, channel, 'players', (b) => {
+      const name = b.realUsername || b.options.username;
+      if (!b.isOnline) {
+        return channel.send(msg(`**${name}** — still connecting`));
+      }
+      const { nearby, farOnline } = b.getPlayersInfo();
+      const rows = [];
+      for (const p of nearby) {
+        rows.push(`**${p.username}** — \`${p.distance}m away\` (\`X: ${p.x}, Y: ${p.y}, Z: ${p.z}\`)`);
+      }
+      for (const u of farOnline) {
+        rows.push(`**${u}** — online *(outside render distance)*`);
+      }
+      if (rows.length === 0) {
+        return channel.send(msg(`**Players seen by ${name}**\n-# No other players currently online on this server.`));
+      }
+      return channel.send(
+        msgList(
+          `**Players on ${formatServerDisplayName(b.options.host)}** *(via ${name})*`,
+          rows,
+          `-# Tip: run \`!follow <player>\` or \`!come <player>\` to walk over to someone`
+        )
+      );
+    });
   }
 
   formatCoordsText(bot) {
     const name = bot.realUsername || bot.options.username;
     const coords = bot.getCoords?.();
     const uptime = bot.getUptimeString?.();
+    const modeLabel = bot.getModeLabel?.() || 'AFK';
     const editionLabel =
       bot.edition === 'java'
         ? `Java${bot.serverVersion ? ` ${bot.serverVersion}` : ''}`
@@ -355,32 +423,18 @@ export class BotManager {
     const upTag = uptime ? ` · uptime ${uptime}` : '';
     return (
       `**${name}** — \`X: ${coords.x}, Y: ${coords.y}, Z: ${coords.z}\`\n` +
-      `-# ${bot.options.host}:${bot.options.port} · ${editionLabel}${upTag}${sneakTag}`
+      `-# ${bot.options.host}:${bot.options.port} · ${editionLabel} · Mode: ${modeLabel}${upTag}${sneakTag}`
     );
   }
 
   coords(username, host, channel, defaultHost = null) {
-    const { match, ambiguous } = this.findBotFlexible(username, host, defaultHost);
-    if (match) {
-      return channel.send(msg(this.formatCoordsText(match.bot)));
-    }
-    if (ambiguous) {
-      return channel.send(msg('Multiple bots active — specify `!coords <username>` or `!coords <ip> <username>`'));
-    }
-    return channel.send(msg(username ? `no bot named **${username}**` : 'no active bots'));
+    return this._runBotAction(username, host, defaultHost, channel, 'coords', (b) =>
+      channel.send(msg(this.formatCoordsText(b)))
+    );
   }
 
   say(username, host, chatText, channel, defaultHost = null) {
-    const { match, ambiguous } = this.findBotFlexible(username, host, defaultHost);
-    if (match) {
-      match.bot.say(chatText);
-      return;
-    }
-    if (ambiguous) {
-      channel.send(msg('Multiple bots active — specify `!say <username> <message>` or `!say <ip> <username> <message>`'));
-      return;
-    }
-    channel.send(msg(username ? `no bot named **${username}**` : 'no active bots'));
+    return this._runBotAction(username, host, defaultHost, channel, 'say', (b) => b.say(chatText));
   }
 
   // Interactive Discord V2 status & control panel
@@ -427,19 +481,24 @@ export class BotManager {
 
       const coords = bot.getCoords?.();
       const uptime = bot.getUptimeString?.();
-      const metaParts = [];
+      const modeLabel = bot.getModeLabel?.() || 'AFK';
+      const metaParts = [`Mode: **${modeLabel}**`];
       if (coords) metaParts.push(`XYZ: \`${coords.x}, ${coords.y}, ${coords.z}\``);
       if (uptime) metaParts.push(`up ${uptime}`);
       if (bot.isSneaking) metaParts.push('sneaking');
 
-      const metaLine = metaParts.length > 0 ? `\n-# ${metaParts.join(' · ')}` : '';
+      const metaLine = `\n-# ${metaParts.join(' · ')}`;
       c.addTextDisplayComponents(
         text(`**${name}** — ${bot.options.host}:${bot.options.port} (${editionLabel}) — **${state}**${metaLine}`)
       );
 
       if (idx < interactiveBots.length) {
         c.addActionRowComponents(
-          buildBotControlRow(bot.botId, { isOnline: bot.isOnline, isSneaking: bot.isSneaking })
+          buildBotControlRow(bot.botId, {
+            isOnline: bot.isOnline,
+            isSneaking: bot.isSneaking,
+            mode: bot.mode,
+          })
         );
       }
     });
@@ -447,9 +506,7 @@ export class BotManager {
     c.addSeparatorComponents(thinDivider());
     const onlineCount = allBots.filter((b) => b.isOnline).length;
     c.addTextDisplayComponents(
-      text(
-        `-# ${onlineCount}/${allBots.length} online · ${defaultFooterLine}`
-      )
+      text(`-# ${onlineCount}/${allBots.length} online · ${defaultFooterLine}`)
     );
 
     const bottomButtons = [button('bot:refresh', 'Refresh', ButtonStyle.Secondary)];
