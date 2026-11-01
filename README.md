@@ -19,14 +19,19 @@ A Discord-controlled Minecraft AFK bot supporting **Bedrock Edition** (including
 
 ## Commands
 
+Save your server once with `!setserver`, and you can use short commands without retyping the IP every time:
+
 | Command | Description |
 |---|---|
-| `!join [bedrock\|java] <ip[:port]> [username]` | Join a cracked server (defaults to `bedrock` on port `19132`) |
-| `!premjoin [bedrock\|java] <ip[:port]>` | Join an online-mode server with a Microsoft / Xbox account |
-| `!leave <ip> <username>` | Disconnect a specific bot |
-| `!say <ip> <username> <message>` | Send a chat message or `/command` in-game |
-| `!jump <ip> <username>` | Manually trigger a jump |
-| `!bots` | List all active bots, editions, versions, and status |
+| `!setserver [bedrock\|java] <ip[:port]>` | Save your default server (persists across restarts; `!setserver clear` to reset) |
+| `!join [username]` | Join your default server (or `!join [bedrock\|java] <ip[:port]> [username]`) |
+| `!premjoin` | Join via Microsoft / Xbox account (or `!premjoin [bedrock\|java] <ip[:port]>`) |
+| `!bots` | Interactive status & button control panel (**Jump**, **Sneak**, **Coords**, **Leave**) |
+| `!say [username] <message>` | Send chat or a `/command` in-game (also supports `!say <ip> <username> <msg>`) |
+| `!jump [username]` | Manually trigger a jump |
+| `!sneak [username]` | Toggle crouch / sneak on or off |
+| `!coords [username]` | Show live `X / Y / Z` coordinates & uptime |
+| `!leave [username \| all]` | Disconnect a bot or all active bots |
 | `!help` | Show the command list |
 
 > **Tip:** Wrap Bedrock gamertags containing spaces in quotes, e.g. `!join bedrock RndmCraft.aternos.me "My Bot"`.

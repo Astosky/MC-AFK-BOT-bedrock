@@ -2,7 +2,16 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { createRequire } from 'module';
-import { msg, msgSections } from './ui.js';
+import {
+  msg,
+  msgSections,
+  ContainerBuilder,
+  MessageFlags,
+  thinDivider,
+  text,
+  buildBotControlRow,
+  formatDuration,
+} from './ui.js';
 import { connectBedrockClient, BEDROCK_CURRENT_VERSION } from './bedrockTransport.js';
 
 const require = createRequire(import.meta.url);
@@ -94,6 +103,8 @@ export class BedrockBot {
    */
   constructor(options, discordChannel, onFatal, onRealUsername, authPassword) {
     this.edition = 'bedrock';
+    this.botId = options.botId || `b_${Math.random().toString(36).slice(2, 8)}`;
+    this.onStateChange = options.onStateChange || null;
     this.options = { ...options, port: options.port || 19132 };
     this.discordChannel = discordChannel;
     this.onFatal = onFatal;
@@ -112,6 +123,9 @@ export class BedrockBot {
     this.isFatal = false;
     this.isDisconnecting = false;
     this.inGame = false;
+    this.connectedAt = null;
+    this.isSneaking = false;
+    this._pendingSneakTransition = null;
     this.reconnectAttempts = 0;
     this.serverIsStarting = false;
     this.spawnedOnce = false;
@@ -369,6 +383,7 @@ export class BedrockBot {
       if (this.isStopping || this.isFatal) return;
 
       this.inGame = true;
+      this.connectedAt = Date.now();
       this.reconnectAttempts = 0;
       this.serverIsStarting = false;
       this.isDisconnecting = false;
@@ -382,11 +397,20 @@ export class BedrockBot {
         this.onRealUsername(name);
       }
 
-      this.send(
-        msg(
+      if (this.onStateChange) this.onStateChange();
+
+      const c = new ContainerBuilder();
+      c.addTextDisplayComponents(
+        text(
           `**${name}** connected to **${this.options.host}:${this.options.port}**\n-# Bedrock ${this.serverVersion} · ${this.transportLabel}`
         )
       );
+      c.addSeparatorComponents(thinDivider());
+      c.addActionRowComponents(
+        buildBotControlRow(this.botId, { isOnline: true, isSneaking: this.isSneaking })
+      );
+
+      this.send({ components: [c], flags: MessageFlags.IsComponentsV2 });
       this.startAntiAfk();
     });
 
@@ -552,6 +576,8 @@ export class BedrockBot {
     if (this.isStopping || this.isFatal) return;
     this.stopAntiAfk();
     this.inGame = false;
+    this.connectedAt = null;
+    if (this.onStateChange) this.onStateChange();
 
     const name = this.realUsername || this.options.username;
     const maxAttempts = this.serverIsStarting ? MAX_STARTING_RECONNECTS : MAX_RECONNECTS;
@@ -598,6 +624,16 @@ export class BedrockBot {
         this.jumpStartedThisCycle = false;
       }
       this.jumpTicksRemaining--;
+    }
+    if (this.isSneaking) {
+      flags.push('sneaking', 'sneak_down');
+    }
+    if (this._pendingSneakTransition === 'start') {
+      flags.push('start_sneaking');
+      this._pendingSneakTransition = null;
+    } else if (this._pendingSneakTransition === 'stop') {
+      flags.push('stop_sneaking');
+      this._pendingSneakTransition = null;
     }
 
     let inputData;
@@ -718,14 +754,46 @@ export class BedrockBot {
     } catch {}
   }
 
-  jump() {
+  getCoords() {
+    if (!this.inGame || !this.position) return null;
+    // Bedrock player_position.y is eye level (~1.62 above feet)
+    return {
+      x: Math.round(this.position.x),
+      y: Math.round(this.position.y - 1.62),
+      z: Math.round(this.position.z),
+    };
+  }
+
+  getUptimeString() {
+    if (!this.connectedAt) return null;
+    return formatDuration(Date.now() - this.connectedAt);
+  }
+
+  jump({ silent = false } = {}) {
     const name = this.realUsername || this.options.username;
     if (!this.inGame) {
-      this.send(msg(`**${name}** — not in-game, cannot jump`));
-      return;
+      const m = `**${name}** — not in-game, cannot jump`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, message: m };
     }
     this._triggerJump();
-    this.send(msg(`**${name}** jumped`));
+    const m = `**${name}** jumped`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, message: m };
+  }
+
+  toggleSneak({ silent = false } = {}) {
+    const name = this.realUsername || this.options.username;
+    if (!this.inGame) {
+      const m = `**${name}** — not in-game, cannot toggle sneak`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, sneaking: this.isSneaking, message: m };
+    }
+    this.isSneaking = !this.isSneaking;
+    this._pendingSneakTransition = this.isSneaking ? 'start' : 'stop';
+    const m = `**${name}** sneak **${this.isSneaking ? 'ON' : 'OFF'}**`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, sneaking: this.isSneaking, message: m };
   }
 
   say(text) {
@@ -763,5 +831,7 @@ export class BedrockBot {
       }
     }
     this.inGame = false;
+    this.connectedAt = null;
+    if (this.onStateChange) this.onStateChange();
   }
 }

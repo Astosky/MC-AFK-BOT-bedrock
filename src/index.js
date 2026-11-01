@@ -4,23 +4,35 @@ import 'dotenv/config';
 import { Client, GatewayIntentBits, Partials } from 'discord.js';
 import {
   msg,
+  msgWithButtons,
   ContainerBuilder,
+  ButtonStyle,
   MessageFlags,
   thinDivider,
   text,
+  button,
+  buildBotControlRow,
 } from './ui.js';
 import { BotManager } from './BotManager.js';
+import {
+  parseServerAddress,
+  looksLikeServerAddress,
+  getDefaultServer,
+  getAnyDefaultServer,
+  setDefaultServer,
+  clearDefaultServer,
+} from './serverConfig.js';
 
 // ─── Startup validation ────────────────────────────────────────────────────────
 
 if (!process.env.DISCORD_TOKEN) {
-  console.error('[ERROR] DISCORD_TOKEN is not set. Add it to your .env file or Pterodactyl startup variables.');
+  console.error('[ERROR] DISCORD_TOKEN is not set. Add it to your .env file or container environment variables.');
   process.exit(1);
 }
 
 const GUILD_ID = process.env.GUILD_ID?.trim() || null;
 
-// ─── Client ───────────────────────────────────────────────────────────────────
+// ─── Client & Live Discord Status ─────────────────────────────────────────────
 
 const client = new Client({
   intents: [
@@ -31,7 +43,20 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-const botManager = new BotManager();
+function syncDiscordPresence() {
+  if (!client.user) return;
+  try {
+    const defaultSrv = getDefaultServer(GUILD_ID) || getAnyDefaultServer();
+    const presence = botManager.getPresenceData(defaultSrv);
+    client.user.setPresence(presence);
+  } catch {
+    // Ignore transient gateway state errors
+  }
+}
+
+const botManager = new BotManager({
+  onChange: () => syncDiscordPresence(),
+});
 
 client.on('clientReady', () => {
   if (GUILD_ID) {
@@ -39,21 +64,27 @@ client.on('clientReady', () => {
   } else {
     console.log(`Discord bot logged in as ${client.user.tag} — active in all servers`);
   }
+  syncDiscordPresence();
+  // Refresh presence periodically in case of Discord gateway reconnects
+  setInterval(syncDiscordPresence, 60_000).unref?.();
 });
 
 // ─── Help ─────────────────────────────────────────────────────────────────────
 
 const COMMANDS = [
-  { usage: '!join [bedrock|java] <ip[:port]> [username]', desc: 'Join a cracked server (defaults to Bedrock).' },
-  { usage: '!premjoin [bedrock|java] <ip[:port]>',        desc: 'Join via Microsoft / Xbox account (defaults to Bedrock).' },
-  { usage: '!leave <ip> <username>',                      desc: 'Disconnect a bot.' },
-  { usage: '!say <ip> <username> <message>',              desc: 'Send chat or a /command in-game.' },
-  { usage: '!bots',                                       desc: 'List all active bots and versions.' },
-  { usage: '!jump <ip> <username>',                       desc: 'Force a bot to jump.' },
-  { usage: '!help',                                       desc: 'Show this reference.' },
+  { usage: '!setserver [bedrock|java] <ip[:port]>', desc: 'Save your default server so short commands work.' },
+  { usage: '!join [username]',                      desc: 'Join your default server (or `!join [bedrock|java] <ip[:port]> [username]`).' },
+  { usage: '!premjoin',                             desc: 'Join via Microsoft / Xbox account (or `!premjoin [bedrock|java] <ip[:port]>`).' },
+  { usage: '!bots',                                 desc: 'Open interactive bot status & button control panel.' },
+  { usage: '!say [username] <message>',             desc: 'Send chat or a `/command` in-game.' },
+  { usage: '!jump [username]',                      desc: 'Force a bot to jump.' },
+  { usage: '!sneak [username]',                     desc: 'Toggle crouch / sneak on or off.' },
+  { usage: '!coords [username]',                    desc: 'Show live X / Y / Z coordinates & uptime.' },
+  { usage: '!leave [username | all]',               desc: 'Disconnect one bot or all active bots.' },
+  { usage: '!help',                                 desc: 'Show this reference.' },
 ];
 
-function buildHelp() {
+function buildHelp(defaultServer) {
   const c = new ContainerBuilder();
 
   c.addTextDisplayComponents(text('## MC AFK Bot Commands'));
@@ -63,11 +94,15 @@ function buildHelp() {
     .map((cmd) => `\`${cmd.usage}\` **- ${cmd.desc}**`)
     .join('\n');
 
+  const defaultLine = defaultServer
+    ? `\n\n**Current Default Server:** \`${defaultServer.host}:${defaultServer.port}\` (${defaultServer.edition === 'java' ? 'Java' : 'Bedrock'})`
+    : '\n\n**Tip:** Run `!setserver <ip[:port]>` once so you can just type `!join AFKBot`!';
+
   c.addTextDisplayComponents(
     text(
-      '**Send Minecraft Bedrock (26.60) & Java AFK bots to any server from Discord.**\n' +
-      '\n' +
-      '**Main Commands:**\n' +
+      '**Send Minecraft Bedrock (26.60) & Java AFK bots to any server from Discord.**' +
+      defaultLine +
+      '\n\n**Commands:**\n' +
       commandLines
     )
   );
@@ -92,7 +127,7 @@ function buildHelp() {
 
 // ─── Per-user command rate limiting ───────────────────────────────────────────
 
-const COOLDOWN_MS = 3_000;
+const COOLDOWN_MS = 2_000;
 const cooldowns = new Map();
 
 function isRateLimited(userId) {
@@ -103,7 +138,7 @@ function isRateLimited(userId) {
   return false;
 }
 
-// ─── Argument & address parsing helpers ───────────────────────────────────────
+// ─── Argument & username helpers ──────────────────────────────────────────────
 
 const JAVA_USERNAME_RE = /^[a-zA-Z0-9_]{3,16}$/;
 const BEDROCK_USERNAME_RE = /^[a-zA-Z0-9_][a-zA-Z0-9_ -]{1,14}[a-zA-Z0-9_]$/;
@@ -127,47 +162,6 @@ function tokenizeCommand(input) {
   return tokens;
 }
 
-// Sanitize Discord markdown links, <http://...>, schemes, and split host[:port]
-function parseServerAddress(raw, defaultPort) {
-  if (!raw) return null;
-  let cleaned = String(raw).trim();
-
-  // Extract target from markdown [label](url) if pasted
-  const mdMatch = cleaned.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-  if (mdMatch) cleaned = mdMatch[1];
-
-  cleaned = cleaned
-    .replace(/^<+|>+$/g, '')
-    .replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '')
-    .replace(/\/.*$/, '')
-    .trim();
-
-  if (!cleaned) return null;
-
-  let host = cleaned;
-  let port = defaultPort;
-
-  // IPv6 [::1]:19132
-  const ipv6Match = cleaned.match(/^\[([^\]]+)\](?::(\d+))?$/);
-  if (ipv6Match) {
-    host = ipv6Match[1];
-    if (ipv6Match[2]) port = parseInt(ipv6Match[2], 10);
-  } else {
-    const colonIdx = cleaned.lastIndexOf(':');
-    if (colonIdx > 0 && cleaned.indexOf(':') === colonIdx) {
-      const maybePort = cleaned.slice(colonIdx + 1);
-      host = cleaned.slice(0, colonIdx);
-      if (/^\d+$/.test(maybePort)) {
-        const parsed = parseInt(maybePort, 10);
-        if (parsed >= 1 && parsed <= 65535) port = parsed;
-      }
-    }
-  }
-
-  if (!host) return null;
-  return { host, port };
-}
-
 function extractEdition(token) {
   if (!token) return null;
   const lower = token.toLowerCase();
@@ -176,7 +170,80 @@ function extractEdition(token) {
   return null;
 }
 
+function pickDefaultUsername(host) {
+  if (!botManager.hasBotOnHost('AFKBot', host)) {
+    return 'AFKBot';
+  }
+  return `AFK_${Math.floor(1000 + Math.random() * 9000)}`;
+}
+
+// Parse `[ip] [username]` for single-action commands (!leave, !jump, !sneak, !coords)
+function resolveBotTargetArgs(args) {
+  if (!args[1]) {
+    return { host: null, username: null };
+  }
+  if (args[2]) {
+    const parsed = parseServerAddress(args[1], 19132);
+    if (!parsed) return { error: 'invalid server address' };
+    return { host: parsed.host, username: args[2] };
+  }
+  if (looksLikeServerAddress(args[1])) {
+    const parsed = parseServerAddress(args[1], 19132);
+    return { host: parsed?.host || null, username: null };
+  }
+  return { host: null, username: args[1] };
+}
+
+function isBotsPanelMessage(discordMessage) {
+  try {
+    const raw = JSON.stringify(discordMessage?.components || []);
+    return raw.includes('"bot:refresh"');
+  } catch {
+    return false;
+  }
+}
+
+function rebuildConnectedBotCard(bot, disconnected = false) {
+  const name = bot.realUsername || bot.options.username;
+  const verLine =
+    bot.edition === 'java'
+      ? `Java${bot.serverVersion ? ` ${bot.serverVersion}` : ''}`
+      : `Bedrock ${bot.serverVersion} · ${bot.transportLabel || 'Bedrock'}`;
+
+  const c = new ContainerBuilder();
+  if (disconnected) {
+    c.addTextDisplayComponents(
+      text(`**${name}** disconnected from **${bot.options.host}:${bot.options.port}**\n-# ${verLine}`)
+    );
+  } else {
+    c.addTextDisplayComponents(
+      text(`**${name}** connected to **${bot.options.host}:${bot.options.port}**\n-# ${verLine}`)
+    );
+    c.addSeparatorComponents(thinDivider());
+    c.addActionRowComponents(
+      buildBotControlRow(bot.botId, { isOnline: bot.isOnline, isSneaking: bot.isSneaking })
+    );
+  }
+  return { components: [c], flags: MessageFlags.IsComponentsV2 };
+}
+
 // ─── Commands ─────────────────────────────────────────────────────────────────
+
+const KNOWN_COMMANDS = new Set([
+  '!help',
+  '!setserver',
+  '!setseerver',
+  '!server',
+  '!join',
+  '!premjoin',
+  '!leave',
+  '!say',
+  '!bots',
+  '!status',
+  '!jump',
+  '!sneak',
+  '!coords',
+]);
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
@@ -189,42 +256,148 @@ client.on('messageCreate', async (message) => {
   if (tokens.length === 0) return;
 
   const args = tokens.map((t) => t.value);
-  const command = args[0].toLowerCase();
+  const rawCmd = args[0].toLowerCase();
+  if (!KNOWN_COMMANDS.has(rawCmd)) return;
 
-  const knownCommands = ['!help', '!join', '!premjoin', '!leave', '!say', '!bots', '!jump'];
-  if (!knownCommands.includes(command)) return;
+  // Normalize aliases
+  const command =
+    rawCmd === '!setseerver' || rawCmd === '!server'
+      ? '!setserver'
+      : rawCmd === '!status'
+        ? '!bots'
+        : rawCmd;
 
   if (isRateLimited(message.author.id)) {
     return message.reply(msg('-# Please wait a moment before sending another command.'));
   }
 
+  const defaultServer = getDefaultServer(message.guild.id);
+
   // !help
   if (command === '!help') {
-    return message.reply(buildHelp());
+    return message.reply(buildHelp(defaultServer));
   }
 
-  // !join [bedrock|java] <ip[:port]> [username]
-  if (command === '!join') {
+  // !setserver [bedrock|java] <ip[:port]> | !setserver clear | !setserver
+  if (command === '!setserver') {
     if (!args[1]) {
-      return message.reply(msg('usage: `!join [bedrock|java] <ip[:port]> [username]`'));
+      if (!defaultServer) {
+        return message.reply(
+          msg(
+            'No default server set yet.\n-# Set one with `!setserver <ip[:port]>` (or `!setserver java <ip[:port]>`) so `!join AFKBot` works directly.'
+          )
+        );
+      }
+      const edLabel = defaultServer.edition === 'java' ? 'Java' : 'Bedrock';
+      return message.reply(
+        msgWithButtons(
+          `**Default Server:** \`${defaultServer.host}:${defaultServer.port}\` (${edLabel})\n` +
+          `-# Run \`!join AFKBot\` (or click below) · Clear anytime with \`!setserver clear\``,
+          button('bot:quickjoin', 'Join AFKBot', ButtonStyle.Success)
+        )
+      );
+    }
+
+    if (['clear', 'reset', 'none', 'off'].includes(args[1].toLowerCase())) {
+      clearDefaultServer(message.guild.id);
+      syncDiscordPresence();
+      return message.reply(msg('Cleared default server.'));
     }
 
     const explicitEdition = extractEdition(args[1]);
     const edition = explicitEdition || 'bedrock';
     const addrArg = explicitEdition ? args[2] : args[1];
-    const usernameArg = explicitEdition ? args[3] : args[2];
 
     if (!addrArg) {
-      return message.reply(msg(`usage: \`!join ${edition} <ip[:port]> [username]\``));
+      return message.reply(msg(`usage: \`!setserver ${edition} <ip[:port]>\``));
     }
 
     const defaultPort = edition === 'java' ? 25565 : 19132;
     const parsed = parseServerAddress(addrArg, defaultPort);
-    if (!parsed) {
-      return message.reply(msg('invalid server address — example: `!join bedrock RndmCraft.aternos.me`'));
+    if (!parsed || !looksLikeServerAddress(addrArg)) {
+      return message.reply(
+        msg('invalid server address — example: `!setserver RndmCraft.aternos.me:19132`')
+      );
     }
 
-    const username = usernameArg || `AFK_${Math.floor(1000 + Math.random() * 9000)}`;
+    const saved = setDefaultServer(message.guild.id, {
+      edition,
+      host: parsed.host,
+      port: parsed.port,
+    });
+    syncDiscordPresence();
+
+    const edLabel = saved.edition === 'java' ? 'Java' : 'Bedrock';
+    return message.reply(
+      msgWithButtons(
+        `Default server saved: **${saved.host}:${saved.port}** (${edLabel})\n` +
+        `-# Now you can simply use \`!join AFKBot\`, \`!premjoin\`, \`!bots\`, \`!say\`, and \`!leave\`.`,
+        button('bot:quickjoin', 'Join AFKBot', ButtonStyle.Success)
+      )
+    );
+  }
+
+  // !join [bedrock|java] [ip[:port]] [username]
+  if (command === '!join') {
+    const explicitEdition = extractEdition(args[1]);
+    const rest = explicitEdition ? args.slice(2) : args.slice(1);
+
+    let edition = explicitEdition || defaultServer?.edition || 'bedrock';
+    let targetHost = null;
+    let targetPort = null;
+    let username = null;
+
+    if (rest.length === 0) {
+      // `!join` or `!join bedrock` -> use default server
+      if (!defaultServer) {
+        return message.reply(
+          msg('No default server set — run `!setserver <ip[:port]>` first, or use `!join <ip[:port]> [username]`.')
+        );
+      }
+      if (!explicitEdition) edition = defaultServer.edition;
+      targetHost = defaultServer.host;
+      targetPort = explicitEdition && explicitEdition !== defaultServer.edition
+        ? (edition === 'java' ? 25565 : 19132)
+        : defaultServer.port;
+      username = pickDefaultUsername(targetHost);
+    } else if (rest.length === 1) {
+      // Either `!join AFKBot` (username on default server) OR `!join RndmCraft.aternos.me` (server IP)
+      if (looksLikeServerAddress(rest[0])) {
+        const defaultPort = edition === 'java' ? 25565 : 19132;
+        const parsed = parseServerAddress(rest[0], defaultPort);
+        if (!parsed) {
+          return message.reply(msg('invalid server address — example: `!join RndmCraft.aternos.me AFKBot`'));
+        }
+        targetHost = parsed.host;
+        targetPort = parsed.port;
+        username = pickDefaultUsername(targetHost);
+      } else {
+        if (!defaultServer) {
+          return message.reply(
+            msg(
+              `No default server set for **${rest[0]}** — save one once with \`!setserver <ip[:port]>\`, or run \`!join <ip[:port]> ${rest[0]}\`.`
+            )
+          );
+        }
+        if (!explicitEdition) edition = defaultServer.edition;
+        targetHost = defaultServer.host;
+        targetPort = explicitEdition && explicitEdition !== defaultServer.edition
+          ? (edition === 'java' ? 25565 : 19132)
+          : defaultServer.port;
+        username = rest[0];
+      }
+    } else {
+      // `!join <ip[:port]> <username>`
+      const defaultPort = edition === 'java' ? 25565 : 19132;
+      const parsed = parseServerAddress(rest[0], defaultPort);
+      if (!parsed) {
+        return message.reply(msg('invalid server address — example: `!join RndmCraft.aternos.me AFKBot`'));
+      }
+      targetHost = parsed.host;
+      targetPort = parsed.port;
+      username = rest[1];
+    }
+
     if (!isValidUsername(username, edition)) {
       const rule =
         edition === 'java'
@@ -233,67 +406,253 @@ client.on('messageCreate', async (message) => {
       return message.reply(msg(`invalid username **${username}**\n-# Must be ${rule}`));
     }
 
-    botManager.joinCracked({ edition, host: parsed.host, port: parsed.port, username }, message.channel);
+    botManager.joinCracked({ edition, host: targetHost, port: targetPort, username }, message.channel);
     return;
   }
 
-  // !premjoin [bedrock|java] <ip[:port]>
+  // !premjoin [bedrock|java] [ip[:port]]
   if (command === '!premjoin') {
-    if (!args[1]) {
-      return message.reply(msg('usage: `!premjoin [bedrock|java] <ip[:port]>`'));
-    }
-
     const explicitEdition = extractEdition(args[1]);
-    const edition = explicitEdition || 'bedrock';
     const addrArg = explicitEdition ? args[2] : args[1];
 
+    let edition = explicitEdition || defaultServer?.edition || 'bedrock';
+    let targetHost = null;
+    let targetPort = null;
+
     if (!addrArg) {
-      return message.reply(msg(`usage: \`!premjoin ${edition} <ip[:port]>\``));
+      if (!defaultServer) {
+        return message.reply(
+          msg('No default server set — run `!setserver <ip[:port]>` first, or use `!premjoin <ip[:port]>`.')
+        );
+      }
+      if (!explicitEdition) edition = defaultServer.edition;
+      targetHost = defaultServer.host;
+      targetPort = explicitEdition && explicitEdition !== defaultServer.edition
+        ? (edition === 'java' ? 25565 : 19132)
+        : defaultServer.port;
+    } else {
+      const defaultPort = edition === 'java' ? 25565 : 19132;
+      const parsed = parseServerAddress(addrArg, defaultPort);
+      if (!parsed) {
+        return message.reply(msg('invalid server address — example: `!premjoin RndmCraft.aternos.me`'));
+      }
+      targetHost = parsed.host;
+      targetPort = parsed.port;
     }
 
-    const defaultPort = edition === 'java' ? 25565 : 19132;
-    const parsed = parseServerAddress(addrArg, defaultPort);
-    if (!parsed) {
-      return message.reply(msg('invalid server address — example: `!premjoin bedrock RndmCraft.aternos.me`'));
-    }
-
-    botManager.joinPremium(message.author.id, { edition, host: parsed.host, port: parsed.port }, message.channel);
+    botManager.joinPremium(
+      message.author.id,
+      { edition, host: targetHost, port: targetPort },
+      message.channel
+    );
     return;
   }
 
-  // !leave <ip> <username>
+  // !leave [all | username | <ip> <username>]
   if (command === '!leave') {
-    if (!args[1] || !args[2]) return message.reply(msg('usage: `!leave <ip> <username>`'));
-    const parsed = parseServerAddress(args[1], 19132);
-    if (!parsed) return message.reply(msg('invalid server address'));
-    botManager.removeBot(args[2], parsed.host, message.channel);
-    return;
-  }
-
-  // !say <ip> <username> <message...>
-  if (command === '!say') {
-    if (!args[1] || !args[2] || !args[3]) {
-      return message.reply(msg('usage: `!say <ip> <username> <message>`'));
+    if (args[1]?.toLowerCase() === 'all' && !args[2]) {
+      return botManager.removeAllBots(message.channel);
     }
-    const parsed = parseServerAddress(args[1], 19132);
-    if (!parsed) return message.reply(msg('invalid server address'));
-    const chatText = trimmed.slice(tokens[2].endIndex).trim();
-    botManager.say(args[2], parsed.host, chatText, message.channel);
+    const target = resolveBotTargetArgs(args);
+    if (target.error) return message.reply(msg(target.error));
+    botManager.removeBot(target.username, target.host, message.channel, defaultServer?.host || null);
     return;
   }
 
-  // !bots
+  // !say [<ip> <username> <msg> | <username> <msg> | <msg>]
+  if (command === '!say') {
+    if (!args[1]) {
+      return message.reply(msg('usage: `!say [username] <message>` (or `!say <ip> <username> <message>`)'));
+    }
+
+    // 1. Full syntax: `!say <ip> <username> <message...>`
+    if (looksLikeServerAddress(args[1])) {
+      if (!args[2] || !args[3]) {
+        return message.reply(msg('usage: `!say <ip> <username> <message>`'));
+      }
+      const parsed = parseServerAddress(args[1], 19132);
+      if (!parsed) return message.reply(msg('invalid server address'));
+      const chatText = trimmed.slice(tokens[2].endIndex).trim();
+      botManager.say(args[2], parsed.host, chatText, message.channel, defaultServer?.host || null);
+      return;
+    }
+
+    // 2. Short syntax with bot username: `!say AFKBot hello everyone`
+    const namedLookup = botManager.findBotFlexible(args[1], null, defaultServer?.host || null);
+    if (namedLookup.match && args[2]) {
+      const chatText = trimmed.slice(tokens[1].endIndex).trim();
+      namedLookup.match.bot.say(chatText);
+      return;
+    }
+
+    // 3. Single-bot convenience: `!say hello everyone` when 1 bot is active
+    const singleLookup = botManager.findBotFlexible(null, null, defaultServer?.host || null);
+    if (singleLookup.match) {
+      const chatText = trimmed.slice(tokens[0].endIndex).trim();
+      singleLookup.match.bot.say(chatText);
+      return;
+    }
+
+    if (botManager.bots.size > 1) {
+      return message.reply(msg('Multiple bots active — specify `!say <username> <message>`'));
+    }
+    return message.reply(msg('no active bots'));
+  }
+
+  // !bots / !status
   if (command === '!bots') {
-    return message.reply(botManager.getStatus());
+    return message.reply(botManager.getStatus(defaultServer));
   }
 
-  // !jump <ip> <username>
+  // !jump [username | <ip> <username>]
   if (command === '!jump') {
-    if (!args[1] || !args[2]) return message.reply(msg('usage: `!jump <ip> <username>`'));
-    const parsed = parseServerAddress(args[1], 19132);
-    if (!parsed) return message.reply(msg('invalid server address'));
-    botManager.jump(args[2], parsed.host, message.channel);
+    const target = resolveBotTargetArgs(args);
+    if (target.error) return message.reply(msg(target.error));
+    botManager.jump(target.username, target.host, message.channel, defaultServer?.host || null);
     return;
+  }
+
+  // !sneak [username | <ip> <username>]
+  if (command === '!sneak') {
+    const target = resolveBotTargetArgs(args);
+    if (target.error) return message.reply(msg(target.error));
+    botManager.sneak(target.username, target.host, message.channel, defaultServer?.host || null);
+    return;
+  }
+
+  // !coords [username | <ip> <username>]
+  if (command === '!coords') {
+    const target = resolveBotTargetArgs(args);
+    if (target.error) return message.reply(msg(target.error));
+    botManager.coords(target.username, target.host, message.channel, defaultServer?.host || null);
+    return;
+  }
+});
+
+// ─── Interactive Button Handlers ──────────────────────────────────────────────
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isButton()) return;
+  if (GUILD_ID && interaction.guildId !== GUILD_ID) return;
+
+  const customId = interaction.customId || '';
+  if (!customId.startsWith('bot:')) return;
+
+  const defaultServer = getDefaultServer(interaction.guildId);
+  const parts = customId.split(':'); // ['bot', action, optionalBotId]
+  const action = parts[1];
+  const botId = parts[2];
+
+  try {
+    if (action === 'refresh') {
+      await interaction.update(botManager.getStatus(defaultServer));
+      return;
+    }
+
+    if (action === 'quickjoin') {
+      if (!defaultServer) {
+        await interaction.reply({
+          content: 'Set a default server first with `!setserver <ip[:port]>`.',
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const username = pickDefaultUsername(defaultServer.host);
+      botManager.joinCracked(
+        {
+          edition: defaultServer.edition,
+          host: defaultServer.host,
+          port: defaultServer.port,
+          username,
+        },
+        interaction.channel
+      );
+      if (isBotsPanelMessage(interaction.message)) {
+        await interaction.update(botManager.getStatus(defaultServer));
+      } else {
+        await interaction.reply({
+          content: `Launching **${username}** on **${defaultServer.host}:${defaultServer.port}**...`,
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+      return;
+    }
+
+    if (action === 'leaveall') {
+      const count = botManager.bots.size;
+      for (const bot of botManager.bots.values()) {
+        bot.stop();
+      }
+      botManager.bots.clear();
+      syncDiscordPresence();
+      await interaction.update(botManager.getStatus(defaultServer));
+      if (count > 0 && interaction.channel) {
+        interaction.channel.send(msg(`Disconnected **${count}** bot${count === 1 ? '' : 's'}`)).catch(() => {});
+      }
+      return;
+    }
+
+    const found = botId ? botManager.getBotById(botId) : null;
+    if (!found) {
+      if (isBotsPanelMessage(interaction.message)) {
+        await interaction.update(botManager.getStatus(defaultServer));
+      } else {
+        await interaction.reply({
+          content: 'That bot is no longer active.',
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+      return;
+    }
+
+    const { bot } = found;
+
+    if (action === 'jump') {
+      const res = bot.jump({ silent: true });
+      await interaction.reply({
+        content: res.message,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (action === 'sneak') {
+      const res = bot.toggleSneak({ silent: true });
+      if (!res.ok) {
+        await interaction.reply({
+          content: res.message,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      if (isBotsPanelMessage(interaction.message)) {
+        await interaction.update(botManager.getStatus(defaultServer));
+      } else {
+        await interaction.update(rebuildConnectedBotCard(bot, false));
+      }
+      return;
+    }
+
+    if (action === 'coords') {
+      await interaction.reply({
+        content: botManager.formatCoordsText(bot),
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (action === 'leave') {
+      const { displayName, host } = botManager.removeByEntry(found);
+      if (isBotsPanelMessage(interaction.message)) {
+        await interaction.update(botManager.getStatus(defaultServer));
+        interaction.channel?.send(msg(`**${displayName}** disconnected from **${host}**`)).catch(() => {});
+      } else {
+        await interaction.update(rebuildConnectedBotCard(bot, true));
+      }
+      return;
+    }
+  } catch (err) {
+    console.error('[Discord Interaction Error]', err);
   }
 });
 

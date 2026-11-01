@@ -4,7 +4,16 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import mineflayer from 'mineflayer';
-import { msg, msgSections } from './ui.js';
+import {
+  msg,
+  msgSections,
+  ContainerBuilder,
+  MessageFlags,
+  thinDivider,
+  text,
+  buildBotControlRow,
+  formatDuration,
+} from './ui.js';
 
 const FATAL_CODES = new Set(['ENOTFOUND']);
 const MAX_RECONNECTS = 5;
@@ -64,6 +73,8 @@ export class MinecraftBot {
    */
   constructor(options, discordChannel, onFatal, onRealUsername, authPassword) {
     this.edition = 'java';
+    this.botId = options.botId || `b_${Math.random().toString(36).slice(2, 8)}`;
+    this.onStateChange = options.onStateChange || null;
     this.options = { ...options, port: options.port || 25565 };
     this.discordChannel = discordChannel;
     this.onFatal = onFatal;
@@ -75,6 +86,8 @@ export class MinecraftBot {
     this.isStopping = false;
     this.isFatal = false;
     this.isDisconnecting = false;
+    this.connectedAt = null;
+    this.isSneaking = false;
     this.reconnectAttempts = 0;
     this.spawnedOnce = false;
     this.realUsername = null;
@@ -172,6 +185,7 @@ export class MinecraftBot {
     this.bot.on('spawn', () => {
       if (this.isStopping || this.isFatal) return;
 
+      this.connectedAt = Date.now();
       this.reconnectAttempts = 0;
       this.isDisconnecting = false;
       this.lastErrorReason = null;
@@ -179,15 +193,28 @@ export class MinecraftBot {
       this.realUsername = name;
       this.serverVersion = this.bot.version || this.bot._client?.version || null;
 
+      if (this.isSneaking && this.bot?.entity) {
+        this.bot.setControlState('sneak', true);
+      }
+
       if (!this.spawnedOnce && this.onRealUsername) {
         this.spawnedOnce = true;
         this.onRealUsername(name);
       }
 
+      if (this.onStateChange) this.onStateChange();
+
       const verTag = this.serverVersion ? `Java ${this.serverVersion}` : 'Java';
-      this.send(
-        msg(`**${name}** connected to **${this.options.host}:${this.options.port}**\n-# ${verTag}`)
+      const c = new ContainerBuilder();
+      c.addTextDisplayComponents(
+        text(`**${name}** connected to **${this.options.host}:${this.options.port}**\n-# ${verTag}`)
       );
+      c.addSeparatorComponents(thinDivider());
+      c.addActionRowComponents(
+        buildBotControlRow(this.botId, { isOnline: true, isSneaking: this.isSneaking })
+      );
+
+      this.send({ components: [c], flags: MessageFlags.IsComponentsV2 });
       this.startAntiAfk();
     });
 
@@ -263,6 +290,8 @@ export class MinecraftBot {
   handleDisconnect() {
     if (this.isStopping || this.isFatal) return;
     this.stopAntiAfk();
+    this.connectedAt = null;
+    if (this.onStateChange) this.onStateChange();
 
     const name = this.realUsername || this.options.username;
 
@@ -317,15 +346,47 @@ export class MinecraftBot {
     if (this.lookInterval) { clearInterval(this.lookInterval); this.lookInterval = null; }
   }
 
-  jump() {
+  getCoords() {
+    const pos = this.bot?.entity?.position;
+    if (!pos) return null;
+    return {
+      x: Math.round(pos.x),
+      y: Math.round(pos.y),
+      z: Math.round(pos.z),
+    };
+  }
+
+  getUptimeString() {
+    if (!this.connectedAt) return null;
+    return formatDuration(Date.now() - this.connectedAt);
+  }
+
+  jump({ silent = false } = {}) {
     const name = this.realUsername || this.options.username;
     if (!this.bot?.entity) {
-      this.send(msg(`**${name}** — not in-game, cannot jump`));
-      return;
+      const m = `**${name}** — not in-game, cannot jump`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, message: m };
     }
     this.bot.setControlState('jump', true);
     setTimeout(() => { if (this.bot) this.bot.setControlState('jump', false); }, 400);
-    this.send(msg(`**${name}** jumped`));
+    const m = `**${name}** jumped`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, message: m };
+  }
+
+  toggleSneak({ silent = false } = {}) {
+    const name = this.realUsername || this.options.username;
+    if (!this.bot?.entity) {
+      const m = `**${name}** — not in-game, cannot toggle sneak`;
+      if (!silent) this.send(msg(m));
+      return { ok: false, sneaking: this.isSneaking, message: m };
+    }
+    this.isSneaking = !this.isSneaking;
+    this.bot.setControlState('sneak', this.isSneaking);
+    const m = `**${name}** sneak **${this.isSneaking ? 'ON' : 'OFF'}**`;
+    if (!silent) this.send(msg(m));
+    return { ok: true, sneaking: this.isSneaking, message: m };
   }
 
   say(text) {
@@ -348,5 +409,7 @@ export class MinecraftBot {
       try { this.bot.quit(); } catch {}
       this.bot = null;
     }
+    this.connectedAt = null;
+    if (this.onStateChange) this.onStateChange();
   }
 }
