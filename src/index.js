@@ -30,7 +30,7 @@ import {
   setBooruCredentials,
   clearBooruCredentials,
   fetchBooruPosts,
-  buildBooruMessagePayload,
+  deliverBooruResult,
   buildMissingKeyMessage,
 } from './booruService.js';
 import {
@@ -433,6 +433,16 @@ function extractCountAndTags(rawList = []) {
 
 async function handleBooruFetchCommand(message, siteInput, rawTagTokens) {
   const { count, tags } = extractCountAndTags(rawTagTokens);
+  const sendReply = async (opts) => {
+    try {
+      return await message.reply(opts);
+    } catch (e) {
+      if (e?.code === 50035 || e?.code === 10008) {
+        return await message.channel.send(opts);
+      }
+      throw e;
+    }
+  };
 
   try {
     await message.channel.sendTyping?.().catch(() => {});
@@ -445,40 +455,25 @@ async function handleBooruFetchCommand(message, siteInput, rawTagTokens) {
     });
 
     if (result.posts.length === 0) {
-      return await message.reply(
+      return await sendReply(
         msg(
           `No matching posts found on **${result.site.label}** for \`${tags.join(' ') || 'random'}\`.`
         )
       );
     }
 
-    const payload = await buildBooruMessagePayload({
+    return await deliverBooruResult(sendReply, {
       site: result.site,
       posts: result.posts,
       usedTags: result.usedTags,
       includeNextButton: true,
     });
-
-    try {
-      return await message.reply(payload);
-    } catch {
-      // Fallback if Discord cannot unfurl an external URL inside V2 MediaGallery
-      const first = result.posts[0];
-      const fallbackOpts = {
-        content: `**${result.site.label}** · \`${result.usedTags.join(' ') || 'random'}\`\n<${first.pageUrl}>`,
-      };
-      if (payload.files?.length) {
-        fallbackOpts.files = payload.files;
-      } else {
-        fallbackOpts.content += `\n${first.fileUrl}`;
-      }
-      return await message.reply(fallbackOpts);
-    }
   } catch (err) {
+    console.error('[Booru] Command error:', err);
     if (err?.missingAuth && err.site) {
-      return await message.reply(msg(buildMissingKeyMessage(err.site))).catch(() => {});
+      return await sendReply(msg(buildMissingKeyMessage(err.site))).catch(() => {});
     }
-    return await message.reply(msg(err?.message || 'Failed to fetch posts right now.')).catch(() => {});
+    return await sendReply(msg(err?.message || 'Failed to fetch posts right now.')).catch(() => {});
   }
 }
 
@@ -1136,13 +1131,12 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      const payload = await buildBooruMessagePayload({
+      await deliverBooruResult((opts) => interaction.editReply(opts), {
         site: result.site,
         posts: result.posts,
         usedTags: result.usedTags,
         includeNextButton: true,
       });
-      await interaction.editReply(payload);
     } catch (err) {
       const errText = err?.missingAuth && err.site ? buildMissingKeyMessage(err.site) : (err?.message || 'Failed to fetch.');
       if (interaction.deferred) {

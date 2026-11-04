@@ -13,6 +13,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   MessageFlags,
+  msg,
   thinDivider,
   text,
   button,
@@ -22,29 +23,33 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, '..', 'auth-cache', 'booru-config.json');
 
-// Honest bot User-Agent avoids Cloudflare JA3 mismatch 403s on Danbooru & Safebooru
-const API_USER_AGENT = 'AstoBot/2.1 (Discord Bot; +https://github.com/Astosky/MC-AFK-BOT-bedrock)';
+const API_USER_AGENT = 'AstoBot/2.2 (Discord Bot; +https://github.com/Astosky/MC-AFK-BOT-bedrock)';
 const CDN_USER_AGENT = 'curl/8.7.1';
-const MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20 MB safe Discord attachment cap
-const FETCH_TIMEOUT_MS = 12_000;
+// Unboosted Discord servers cap uploads at 10 MB; stay safely under at 8.5 MB
+const MAX_UPLOAD_BYTES = Math.floor(8.5 * 1024 * 1024);
+const API_TIMEOUT_MS = 8_000;
+const MEDIA_TIMEOUT_MS = 6_500;
 const MAX_SEEN_HISTORY = 600;
 
+// Keep to static & animated images so Discord MediaGallery renders every post cleanly & fast
 const ALLOWED_EXTENSIONS = new Set([
   '.jpg',
   '.jpeg',
   '.png',
   '.gif',
   '.webp',
-  '.mp4',
-  '.webm',
 ]);
 
-// Friendly tag synonyms when beginners type plain words that return 0 booru hits
+// Friendly tag synonyms when users type plain English words that return 0 booru hits
 const COMMON_TAG_FALLBACKS = {
   girl: '1girl',
+  woman: '1girl',
   boy: '1boy',
+  man: '1boy',
   girls: 'multiple_girls',
+  women: 'multiple_girls',
   boys: 'multiple_boys',
+  men: 'multiple_boys',
 };
 
 // Mandatory safety blocklist — blocks illegal, minor/underage, non-consensual, and extreme tags
@@ -122,6 +127,13 @@ export const BOORU_SITES = {
     requiresKey: false,
     referer: 'https://yande.re/',
   },
+  tbib: {
+    id: 'tbib',
+    label: 'TBIB',
+    nsfwOnly: false,
+    requiresKey: false,
+    referer: 'https://tbib.org/',
+  },
 };
 
 const SITE_ALIASES = {
@@ -144,6 +156,7 @@ const SITE_ALIASES = {
   kona: 'konachan',
   yandere: 'yandere',
   yan: 'yandere',
+  tbib: 'tbib',
 };
 
 export function resolveBooruSite(raw = '') {
@@ -166,85 +179,80 @@ function readConfig() {
   }
 }
 
-function writeConfig(data) {
+function writeConfig(cfg) {
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(data, null, 2), 'utf8');
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
 }
 
 function isValidCredPair(userId, apiKey) {
-  return (
-    Boolean(userId) &&
-    Boolean(apiKey) &&
-    /^\d+$/.test(String(userId).trim()) &&
-    /^[a-zA-Z0-9_-]{16,}$/.test(String(apiKey).trim())
-  );
+  const uid = String(userId || '').trim();
+  const key = String(apiKey || '').trim();
+  if (!/^\d+$/.test(uid)) return false;
+  if (key.length < 16 || key.includes('&') || key.includes('=')) return false;
+  return true;
 }
 
 export function getBooruCredentials(siteId) {
-  if (siteId === 'gelbooru') {
-    const envUser = process.env.GELBOORU_USER_ID?.trim();
-    const envKey = process.env.GELBOORU_API_KEY?.trim();
-    if (isValidCredPair(envUser, envKey)) return { userId: envUser, apiKey: envKey };
-  }
-  if (siteId === 'r34') {
-    const envUser = process.env.R34_USER_ID?.trim();
-    const envKey = process.env.R34_API_KEY?.trim();
-    if (isValidCredPair(envUser, envKey)) return { userId: envUser, apiKey: envKey };
+  const cfg = readConfig();
+  const stored = cfg.keys?.[siteId];
+  if (stored?.userId && stored?.apiKey && isValidCredPair(stored.userId, stored.apiKey)) {
+    return { userId: String(stored.userId).trim(), apiKey: String(stored.apiKey).trim() };
   }
 
-  const cfg = readConfig();
-  const saved = cfg.keys?.[siteId];
-  if (saved && isValidCredPair(saved.userId, saved.apiKey)) {
-    return { userId: String(saved.userId).trim(), apiKey: String(saved.apiKey).trim() };
+  if (siteId === 'gelbooru' && process.env.GELBOORU_USER_ID && process.env.GELBOORU_API_KEY) {
+    const uid = process.env.GELBOORU_USER_ID.trim();
+    const key = process.env.GELBOORU_API_KEY.trim();
+    if (isValidCredPair(uid, key)) return { userId: uid, apiKey: key };
   }
+  if (siteId === 'r34' && process.env.R34_USER_ID && process.env.R34_API_KEY) {
+    const uid = process.env.R34_USER_ID.trim();
+    const key = process.env.R34_API_KEY.trim();
+    if (isValidCredPair(uid, key)) return { userId: uid, apiKey: key };
+  }
+
   return null;
 }
 
-// Supports `!boorukey r34 7006715 <api_key>` AND `&api_key=...&user_id=7006715`
-// Detects blank `api_key=` (before clicking "Generate New Key?" -> Save) and ignores accidental usernames!
-export function parseCredentialInput(tokens = []) {
-  const joined = tokens.join(' ').trim();
+export function parseCredentialInput(rawTokens = []) {
+  const joined = rawTokens.join(' ').trim();
   if (!joined) return { error: 'missing' };
 
-  if (/api_key=|user_id=/i.test(joined)) {
-    const uidMatch = joined.match(/user_id=([^&\s]*)/i);
-    const keyMatch = joined.match(/api_key=([^&\s]*)/i);
-    const extractedUid =
-      uidMatch?.[1]?.trim() || tokens.find((t) => /^\d+$/.test(t.trim()))?.trim() || null;
-    const extractedKey = keyMatch?.[1]?.trim() || '';
+  if (/api_key\s*=|user_id\s*=/i.test(joined)) {
+    const keyMatch = joined.match(/[?&]?api_key=([^&\s]+)/i);
+    const uidMatch = joined.match(/[?&]?user_id=([^&\s]+)/i);
+    const extractedKey = keyMatch ? keyMatch[1].trim() : '';
+    const extractedUid = uidMatch ? uidMatch[1].trim() : '';
 
     if (!extractedKey) {
       return {
         error: 'empty_api_key',
-        partialUserId: extractedUid,
+        partialUserId: /^\d+$/.test(extractedUid) ? extractedUid : null,
       };
     }
-    if (!extractedUid || !/^\d+$/.test(extractedUid)) {
+    if (!/^\d+$/.test(extractedUid)) {
       return { error: 'non_numeric_user_id' };
-    }
-    if (!isValidCredPair(extractedUid, extractedKey)) {
-      return { error: 'invalid_format', partialUserId: extractedUid };
     }
     return { userId: extractedUid, apiKey: extractedKey };
   }
 
-  const trimmedTokens = tokens.map((t) => t.trim()).filter(Boolean);
-  const uidToken = trimmedTokens.find((t) => /^\d+$/.test(t));
-  const keyToken =
-    trimmedTokens.find((t) => t !== uidToken && /^[a-fA-F0-9]{24,}$/.test(t)) ||
-    trimmedTokens.find((t) => t !== uidToken && /^[a-zA-Z0-9_-]{20,}$/.test(t));
-
-  if (!uidToken) {
-    return { error: 'non_numeric_user_id' };
+  const cleaned = rawTokens.map((t) => String(t).trim()).filter(Boolean);
+  if (cleaned.length >= 2) {
+    const numToken = cleaned.find((t) => /^\d+$/.test(t));
+    const keyToken = cleaned.find((t) => t !== numToken && t.length >= 16 && !t.includes('='));
+    if (!numToken) {
+      return { error: 'non_numeric_user_id' };
+    }
+    if (!keyToken) {
+      return { error: 'empty_api_key', partialUserId: numToken };
+    }
+    return { userId: numToken, apiKey: keyToken };
   }
-  if (!keyToken) {
-    return { error: 'empty_api_key', partialUserId: uidToken };
-  }
 
-  return { userId: uidToken, apiKey: keyToken };
+  return { error: 'invalid_format' };
 }
 
 export async function verifyBooruCredentials(site, { userId, apiKey }) {
+  if (!site?.requiresKey) return { ok: true };
   const baseUrl =
     site.id === 'gelbooru'
       ? 'https://gelbooru.com/index.php'
@@ -261,11 +269,10 @@ export async function verifyBooruCredentials(site, { userId, apiKey }) {
   });
 
   try {
-    const res = await fetchWithTimeout(`${baseUrl}?${params.toString()}`, {}, 10_000);
-    const raw = (await res.text()).trim();
+    const { status, text: raw } = await fetchTextWithTimeout(`${baseUrl}?${params.toString()}`, {}, API_TIMEOUT_MS);
     if (
-      res.status === 401 ||
-      res.status === 403 ||
+      status === 401 ||
+      status === 403 ||
       /missing authentication|authentication required|invalid api key/i.test(raw)
     ) {
       return {
@@ -340,6 +347,14 @@ export function validateUserTags(rawTags = []) {
   return { ok: true, tags: cleaned };
 }
 
+function normalizeSearchTags(tags = []) {
+  if (tags.length === 1) {
+    const mapped = COMMON_TAG_FALLBACKS[tags[0].toLowerCase()];
+    if (mapped) return [mapped];
+  }
+  return tags;
+}
+
 function postPassesSafetyAndRating(post, { allowNsfw }) {
   if (!post?.fileUrl) return false;
 
@@ -373,13 +388,13 @@ function normalizeUrl(u) {
   return trimmed;
 }
 
-// ─── API Fetchers ────────────────────────────────────────────────────────────
+// ─── End-to-End Timed Fetchers (Timer covers headers + full body stream!) ────
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+async function fetchTextWithTimeout(url, options = {}, timeoutMs = API_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, {
+    const res = await fetch(url, {
       ...options,
       headers: {
         'User-Agent': API_USER_AGENT,
@@ -388,10 +403,70 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS)
       },
       signal: controller.signal,
     });
+    const bodyText = await res.text();
+    return { ok: res.ok, status: res.status, text: bodyText };
   } finally {
     clearTimeout(timer);
   }
 }
+
+async function fetchBufferWithTimeout(url, options = {}, timeoutMs = MEDIA_TIMEOUT_MS, maxBytes = MAX_UPLOAD_BYTES) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      ...options,
+      headers: {
+        'User-Agent': CDN_USER_AGENT,
+        Accept: '*/*',
+        ...(options.headers || {}),
+      },
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      return { ok: false, status: res.status, buffer: null };
+    }
+
+    const declaredLen = Number(res.headers?.get?.('content-length') || 0);
+    if (declaredLen > maxBytes) {
+      controller.abort();
+      return { ok: false, status: 413, buffer: null };
+    }
+
+    if (!res.body || typeof res.body.getReader !== 'function') {
+      const ab = await res.arrayBuffer();
+      if (ab.byteLength === 0 || ab.byteLength > maxBytes) {
+        return { ok: false, status: 413, buffer: null };
+      }
+      return { ok: true, status: res.status, buffer: Buffer.from(ab) };
+    }
+
+    const reader = res.body.getReader();
+    const chunks = [];
+    let total = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          controller.abort();
+          return { ok: false, status: 413, buffer: null };
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
+
+    if (total === 0) return { ok: false, status: 204, buffer: null };
+    return { ok: true, status: res.status, buffer: Buffer.concat(chunks, total) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ─── Booru API Engines ───────────────────────────────────────────────────────
 
 async function queryDapiSite(site, searchTags, { allowNsfw, page = 0 }) {
   const creds = getBooruCredentials(site.id);
@@ -403,13 +478,10 @@ async function queryDapiSite(site, searchTags, { allowNsfw, page = 0 }) {
   }
 
   const effectiveTags = [...searchTags];
-  if (!allowNsfw && site.id === 'gelbooru' && !effectiveTags.some((t) => t.startsWith('rating:'))) {
-    effectiveTags.push('rating:general');
+  if (!allowNsfw && (site.id === 'gelbooru' || site.id === 'tbib') && !effectiveTags.some((t) => t.startsWith('rating:'))) {
+    effectiveTags.push(site.id === 'gelbooru' ? 'rating:general' : 'rating:safe');
   }
 
-  // Append server-side negative tags only when at least one positive tag is present
-  // (Gelbooru 0.2.x DAPI used by Rule34 & Safebooru returns empty on negative-only queries;
-  //  postPassesSafetyAndRating still enforces BLOCKED_TAGS on every returned post!)
   const hasPositiveTag = effectiveTags.some((t) => t && !t.startsWith('-'));
   if (hasPositiveTag && (site.id === 'gelbooru' || site.id === 'r34')) {
     if (!effectiveTags.includes('-loli')) effectiveTags.push('-loli');
@@ -421,7 +493,9 @@ async function queryDapiSite(site, searchTags, { allowNsfw, page = 0 }) {
       ? 'https://gelbooru.com/index.php'
       : site.id === 'r34'
         ? 'https://api.rule34.xxx/index.php'
-        : 'https://safebooru.org/index.php';
+        : site.id === 'tbib'
+          ? 'https://tbib.org/index.php'
+          : 'https://safebooru.org/index.php';
 
   const params = new URLSearchParams({
     page: 'dapi',
@@ -435,24 +509,24 @@ async function queryDapiSite(site, searchTags, { allowNsfw, page = 0 }) {
     params.set('tags', effectiveTags.join(' '));
   }
 
-  if (creds) {
+  if (creds && site.requiresKey) {
     params.set('user_id', creds.userId);
     params.set('api_key', creds.apiKey);
   }
 
-  let res = await fetchWithTimeout(`${baseUrl}?${params.toString()}`);
-  if (res.status === 403 && !site.requiresKey) {
-    res = await fetchWithTimeout(`${baseUrl}?${params.toString()}`, {
+  let resp = await fetchTextWithTimeout(`${baseUrl}?${params.toString()}`);
+  if (resp.status === 403 && !site.requiresKey) {
+    resp = await fetchTextWithTimeout(`${baseUrl}?${params.toString()}`, {
       headers: { 'User-Agent': CDN_USER_AGENT },
     });
   }
 
-  const rawText = await res.text();
+  const rawText = resp.text;
 
   if (
     site.requiresKey &&
-    (res.status === 401 ||
-      res.status === 403 ||
+    (resp.status === 401 ||
+      resp.status === 403 ||
       /missing authentication|authentication required|invalid api key/i.test(rawText))
   ) {
     const err = new Error(`${site.label} API authentication required or invalid`);
@@ -461,9 +535,9 @@ async function queryDapiSite(site, searchTags, { allowNsfw, page = 0 }) {
     throw err;
   }
 
-  if (!res.ok) {
-    const err = new Error(`${site.label} returned HTTP ${res.status}`);
-    err.httpStatus = res.status;
+  if (!resp.ok) {
+    const err = new Error(`${site.label} returned HTTP ${resp.status}`);
+    err.httpStatus = resp.status;
     throw err;
   }
 
@@ -505,24 +579,36 @@ async function queryDapiSite(site, searchTags, { allowNsfw, page = 0 }) {
     const id = String(p.id);
     const cleanImg = p.image ? String(p.image).split('?')[0] : '';
     let fileUrl = normalizeUrl(p.file_url);
-    if (!fileUrl && site.id === 'safebooru' && p.directory && cleanImg) {
-      fileUrl = `https://safebooru.org/images/${p.directory}/${cleanImg}`;
+    if (!fileUrl && p.directory && cleanImg) {
+      if (site.id === 'safebooru') {
+        fileUrl = `https://safebooru.org/images/${p.directory}/${cleanImg}`;
+      } else if (site.id === 'r34') {
+        fileUrl = `https://api-cdn.rule34.xxx/images/${p.directory}/${cleanImg}`;
+      } else if (site.id === 'tbib') {
+        fileUrl = `https://tbib.org//images/${p.directory}/${cleanImg}`;
+      }
     }
 
+    const hasSample = p.sample === true || p.sample === 1 || p.sample === '1';
     const baseNameNoExt = cleanImg ? cleanImg.replace(/\.[^.]+$/, '') : '';
     const sampleUrl =
-      normalizeUrl(p.sample_url) ||
-      (site.id === 'safebooru' && p.directory && baseNameNoExt && p.sample
+      (hasSample && normalizeUrl(p.sample_url)) ||
+      (site.id === 'safebooru' && p.directory && baseNameNoExt && hasSample
         ? `https://safebooru.org/samples/${p.directory}/sample_${baseNameNoExt}.jpg`
         : null) ||
+      normalizeUrl(p.sample_url) ||
       fileUrl;
+
+    const previewUrl = normalizeUrl(p.preview_url) || sampleUrl || fileUrl;
 
     const pageUrl =
       site.id === 'gelbooru'
         ? `https://gelbooru.com/index.php?page=post&s=view&id=${id}`
         : site.id === 'r34'
           ? `https://rule34.xxx/index.php?page=post&s=view&id=${id}`
-          : `https://safebooru.org/index.php?page=post&s=view&id=${id}`;
+          : site.id === 'tbib'
+            ? `https://tbib.org/index.php?page=post&s=view&id=${id}`
+            : `https://safebooru.org/index.php?page=post&s=view&id=${id}`;
 
     return {
       siteId: site.id,
@@ -530,6 +616,7 @@ async function queryDapiSite(site, searchTags, { allowNsfw, page = 0 }) {
       id,
       fileUrl,
       sampleUrl,
+      previewUrl,
       pageUrl,
       rating: site.id === 'safebooru' ? 'safe' : (p.rating || 'questionable'),
       score: Number(p.score) || 0,
@@ -539,7 +626,6 @@ async function queryDapiSite(site, searchTags, { allowNsfw, page = 0 }) {
   });
 }
 
-// Moebooru JSON API (Konachan & Yande.re — 100% keyless & reliable!)
 async function queryMoebooru(site, searchTags, { allowNsfw, page = 1 }) {
   const effectiveTags = [...searchTags];
   if (!allowNsfw && !effectiveTags.some((t) => t.startsWith('rating:'))) {
@@ -556,27 +642,41 @@ async function queryMoebooru(site, searchTags, { allowNsfw, page = 1 }) {
   const params = new URLSearchParams({
     limit: '100',
     page: String(page),
-    tags: effectiveTags.join(' '),
   });
+  if (effectiveTags.length > 0) {
+    params.set('tags', effectiveTags.join(' '));
+  }
 
-  const res = await fetchWithTimeout(`${host}/post.json?${params.toString()}`);
-  if (!res.ok) {
-    const err = new Error(`${site.label} returned HTTP ${res.status}`);
-    err.httpStatus = res.status;
+  let resp = await fetchTextWithTimeout(`${host}/post.json?${params.toString()}`);
+  if (resp.status === 403 || resp.status === 503) {
+    resp = await fetchTextWithTimeout(`${host}/post.json?${params.toString()}`, {
+      headers: { 'User-Agent': CDN_USER_AGENT },
+    });
+  }
+
+  if (!resp.ok) {
+    const err = new Error(`${site.label} returned HTTP ${resp.status}`);
+    err.httpStatus = resp.status;
     throw err;
   }
 
-  const parsed = await res.json();
+  let parsed;
+  try {
+    parsed = JSON.parse(resp.text);
+  } catch {
+    return [];
+  }
   if (!Array.isArray(parsed)) return [];
 
   return parsed
-    .filter((p) => p?.id && (p.file_url || p.sample_url || p.jpeg_url))
+    .filter((p) => p?.id && (p.sample_url || p.jpeg_url || p.file_url))
     .map((p) => ({
       siteId: site.id,
       siteLabel: site.label,
       id: String(p.id),
-      fileUrl: normalizeUrl(p.sample_url || p.jpeg_url || p.file_url),
-      sampleUrl: normalizeUrl(p.sample_url || p.preview_url || p.file_url),
+      fileUrl: normalizeUrl(p.jpeg_url || p.file_url || p.sample_url),
+      sampleUrl: normalizeUrl(p.sample_url || p.jpeg_url || p.file_url),
+      previewUrl: normalizeUrl(p.preview_url || p.sample_url || p.file_url),
       pageUrl: `${host}/post/show/${p.id}`,
       rating: p.rating || 'q',
       score: Number(p.score) || 0,
@@ -586,32 +686,37 @@ async function queryMoebooru(site, searchTags, { allowNsfw, page = 1 }) {
 }
 
 async function queryDanbooru(site, searchTags, { allowNsfw, page = 1 }) {
-  // Danbooru anonymous tier allows max 2 tags per search
   const effectiveTags = searchTags.slice(0, 2);
   if (!allowNsfw && effectiveTags.length < 2 && !effectiveTags.some((t) => t.startsWith('rating:'))) {
     effectiveTags.push('rating:g');
   }
 
+  const host = allowNsfw ? 'https://danbooru.donmai.us' : 'https://safebooru.donmai.us';
   const params = new URLSearchParams({
     limit: '100',
     page: String(page),
     tags: effectiveTags.join(' '),
   });
 
-  let res = await fetchWithTimeout(`https://danbooru.donmai.us/posts.json?${params.toString()}`);
-  if (res.status === 403) {
-    res = await fetchWithTimeout(`https://danbooru.donmai.us/posts.json?${params.toString()}`, {
+  let resp = await fetchTextWithTimeout(`${host}/posts.json?${params.toString()}`);
+  if (resp.status === 403 || resp.status === 503) {
+    resp = await fetchTextWithTimeout(`${host}/posts.json?${params.toString()}`, {
       headers: { 'User-Agent': CDN_USER_AGENT },
     });
   }
 
-  if (!res.ok) {
-    const err = new Error(`Danbooru returned HTTP ${res.status}`);
-    err.httpStatus = res.status;
+  if (!resp.ok) {
+    const err = new Error(`Danbooru returned HTTP ${resp.status}`);
+    err.httpStatus = resp.status;
     throw err;
   }
 
-  const parsed = await res.json();
+  let parsed;
+  try {
+    parsed = JSON.parse(resp.text);
+  } catch {
+    return [];
+  }
   if (!Array.isArray(parsed)) return [];
 
   return parsed
@@ -620,8 +725,9 @@ async function queryDanbooru(site, searchTags, { allowNsfw, page = 1 }) {
       siteId: site.id,
       siteLabel: site.label,
       id: String(p.id),
-      fileUrl: normalizeUrl(p.large_file_url || p.file_url),
+      fileUrl: normalizeUrl(p.file_url || p.large_file_url),
       sampleUrl: normalizeUrl(p.large_file_url || p.file_url),
+      previewUrl: normalizeUrl(p.preview_file_url || p.large_file_url || p.file_url),
       pageUrl: `https://danbooru.donmai.us/posts/${p.id}`,
       rating: p.rating || 'q',
       score: Number(p.score) || 0,
@@ -656,20 +762,44 @@ async function fetchSiteOnce(site, tags, { allowNsfw }) {
   return posts;
 }
 
+// Multi-site fallback cascade when Cloudflare returns 403/503/5xx on keyless sites from datacenter IPs
 async function fetchRawCandidates(site, tags, { allowNsfw }) {
   try {
     return await fetchSiteOnce(site, tags, { allowNsfw });
-  } catch (err) {
-    // If Cloudflare blocks anonymous Danbooru/Safebooru on container IP, seamlessly fall back to keyless Moebooru
-    if (!site.requiresKey && (err?.httpStatus === 403 || err?.name === 'AbortError')) {
-      const fallbackSite = allowNsfw ? BOORU_SITES.yandere : BOORU_SITES.konachan;
-      return await fetchSiteOnce(fallbackSite, tags, { allowNsfw });
+  } catch (primaryErr) {
+    if (site.requiresKey || primaryErr?.missingAuth) {
+      throw primaryErr;
     }
-    throw err;
+
+    const fallbackOrder = allowNsfw
+      ? [
+          BOORU_SITES.yandere,
+          BOORU_SITES.konachan,
+          ...(getBooruCredentials('gelbooru') ? [BOORU_SITES.gelbooru] : []),
+          ...(getBooruCredentials('r34') ? [BOORU_SITES.r34] : []),
+          BOORU_SITES.tbib,
+          BOORU_SITES.safebooru,
+        ]
+      : [
+          BOORU_SITES.safebooru,
+          BOORU_SITES.konachan,
+          BOORU_SITES.tbib,
+        ];
+
+    for (const candidateSite of fallbackOrder) {
+      if (!candidateSite || candidateSite.id === site.id) continue;
+      try {
+        const posts = await fetchSiteOnce(candidateSite, tags, { allowNsfw });
+        if (posts.length > 0) return posts;
+      } catch {
+        // Continue down the fallback chain
+      }
+    }
+
+    throw primaryErr;
   }
 }
 
-// Fetch `count` fresh, safety-verified posts (with automatic underscore & synonym tag retries!)
 export async function fetchBooruPosts({
   siteInput,
   rawTags = [],
@@ -697,11 +827,11 @@ export async function fetchBooruPosts({
     throw err;
   }
 
-  let usedTags = tagCheck.tags;
+  let usedTags = normalizeSearchTags(tagCheck.tags);
   let candidates = await fetchRawCandidates(site, usedTags, { allowNsfw: effectiveAllowNsfw });
   let valid = candidates.filter((p) => postPassesSafetyAndRating(p, { allowNsfw: effectiveAllowNsfw }));
 
-  // Retry 1: if user typed `!gelbooru blue archive` (spaces instead of `blue_archive`), retry underscored!
+  // Retry multi-word tags joined with underscores (`blue archive` -> `blue_archive`)
   if (
     valid.length === 0 &&
     usedTags.length >= 2 &&
@@ -716,19 +846,6 @@ export async function fetchBooruPosts({
       if (retryValid.length > 0) {
         usedTags = underscored;
         valid = retryValid;
-      }
-    }
-  }
-
-  // Retry 2: if user typed `!safebooru girl` instead of `1girl`, try booru synonym!
-  if (valid.length === 0 && usedTags.length === 1) {
-    const syn = COMMON_TAG_FALLBACKS[usedTags[0].toLowerCase()];
-    if (syn) {
-      const synCandidates = await fetchRawCandidates(site, [syn], { allowNsfw: effectiveAllowNsfw });
-      const synValid = synCandidates.filter((p) => postPassesSafetyAndRating(p, { allowNsfw: effectiveAllowNsfw }));
-      if (synValid.length > 0) {
-        usedTags = [syn];
-        valid = synValid;
       }
     }
   }
@@ -756,48 +873,44 @@ export async function fetchBooruPosts({
   return { site: actualSite, usedTags, posts: picked };
 }
 
-// ─── Media Download & Discord Upload Payload ─────────────────────────────────
+// ─── Media Download & Multi-Stage Discord Delivery ───────────────────────────
 
 async function tryDownloadMedia(post) {
-  // Prefer sampleUrl first when available so high-res 18 MB PNGs upload near-instantly, fallback to fileUrl
-  const urlsToTry = [];
-  if (post.fileUrl) urlsToTry.push(post.fileUrl);
-  if (post.sampleUrl && post.sampleUrl !== post.fileUrl) urlsToTry.push(post.sampleUrl);
+  let ext = '.jpg';
+  try {
+    ext = path.extname(new URL(post.fileUrl).pathname).toLowerCase() || '.jpg';
+  } catch {
+    ext = '.jpg';
+  }
 
-  for (const mediaUrl of urlsToTry) {
+  // Keep animated GIFs using fileUrl first; for static PNG/JPG/WebP try fast sampleUrl (~200 KB) first!
+  const candidateUrls =
+    ext === '.gif'
+      ? [post.fileUrl, post.sampleUrl, post.previewUrl]
+      : [post.sampleUrl, post.fileUrl, post.previewUrl];
+
+  const uniqueUrls = [...new Set(candidateUrls.filter(Boolean))];
+
+  for (const mediaUrl of uniqueUrls) {
     try {
-      let res = await fetchWithTimeout(
-        mediaUrl,
-        {
-          headers: {
-            'User-Agent': CDN_USER_AGENT,
-            Referer: post.referer || 'https://gelbooru.com/',
-            Accept: '*/*',
-          },
-        },
-        FETCH_TIMEOUT_MS
-      );
-      if (res.status === 403) {
-        res = await fetchWithTimeout(mediaUrl, { headers: { Accept: '*/*' } }, FETCH_TIMEOUT_MS);
+      let resp = await fetchBufferWithTimeout(mediaUrl, {
+        headers: { Referer: post.referer || 'https://rule34.xxx/' },
+      });
+      if (resp.status === 403) {
+        resp = await fetchBufferWithTimeout(mediaUrl, {});
       }
-      if (!res.ok) continue;
+      if (!resp.ok || !resp.buffer) continue;
 
-      const contentLen = Number(res.headers.get('content-length') || 0);
-      if (contentLen > MAX_UPLOAD_BYTES) continue;
+      let outExt = path.extname(new URL(mediaUrl).pathname).toLowerCase() || '.jpg';
+      if (!ALLOWED_EXTENSIONS.has(outExt)) outExt = '.jpg';
 
-      const arrayBuf = await res.arrayBuffer();
-      if (arrayBuf.byteLength === 0 || arrayBuf.byteLength > MAX_UPLOAD_BYTES) continue;
-
-      let ext = path.extname(new URL(mediaUrl).pathname).toLowerCase() || '.jpg';
-      if (!ALLOWED_EXTENSIONS.has(ext)) ext = '.jpg';
-
-      const filename = `${post.siteId}_${post.id}${ext}`;
+      const filename = `${post.siteId}_${post.id}${outExt}`;
       return {
-        buffer: Buffer.from(arrayBuf),
+        buffer: resp.buffer,
         filename,
       };
     } catch {
-      // Try next URL
+      // Try next URL in candidateUrls
     }
   }
   return null;
@@ -809,17 +922,18 @@ export async function buildBooruMessagePayload({
   usedTags = [],
   headerPrefix = null,
   includeNextButton = true,
+  attachFiles = true,
 }) {
   const files = [];
   const galleryItems = [];
 
   for (const post of posts) {
-    const downloaded = await tryDownloadMedia(post);
+    const downloaded = attachFiles ? await tryDownloadMedia(post) : null;
     if (downloaded) {
       files.push(new AttachmentBuilder(downloaded.buffer, { name: downloaded.filename }));
       galleryItems.push(new MediaGalleryItemBuilder().setURL(`attachment://${downloaded.filename}`));
     } else {
-      galleryItems.push(new MediaGalleryItemBuilder().setURL(post.fileUrl));
+      galleryItems.push(new MediaGalleryItemBuilder().setURL(post.sampleUrl || post.fileUrl));
     }
   }
 
@@ -849,7 +963,6 @@ export async function buildBooruMessagePayload({
 
   const rowButtons = [];
   if (includeNextButton) {
-    // Never leave a trailing colon when tags are empty; use '_' placeholder
     const encodedTags = usedTags.length > 0 ? usedTags.join(' ').slice(0, 72) : '_';
     rowButtons.push(
       button(`booru:next:${site.id}:${encodedTags}`, 'Another One', ButtonStyle.Primary)
@@ -873,6 +986,81 @@ export async function buildBooruMessagePayload({
     payload.files = files;
   }
   return payload;
+}
+
+// Guaranteed 3-stage delivery so Discord's size cap or Server Explicit Media Filter NEVER causes silence
+export async function deliverBooruResult(
+  sendFn,
+  { site, posts, usedTags = [], headerPrefix = null, includeNextButton = true }
+) {
+  // Stage 1: Full V2 card + downloaded image attachment
+  const payload = await buildBooruMessagePayload({
+    site,
+    posts,
+    usedTags,
+    headerPrefix,
+    includeNextButton,
+    attachFiles: true,
+  });
+
+  try {
+    return await sendFn(payload);
+  } catch (err1) {
+    console.warn('[Booru] Stage 1 send failed:', err1?.code || '', err1?.message || err1);
+
+    // Stage 2: V2 card using remote sampleUrl/fileUrl (no binary upload — bypasses attachment size / scan)
+    try {
+      const urlOnlyPayload = await buildBooruMessagePayload({
+        site,
+        posts,
+        usedTags,
+        headerPrefix,
+        includeNextButton,
+        attachFiles: false,
+      });
+      return await sendFn(urlOnlyPayload);
+    } catch (err2) {
+      console.warn('[Booru] Stage 2 send failed:', err2?.code || '', err2?.message || err2);
+
+      // Stage 3: Guaranteed V2 link card (works even if Discord's Server Safety filter blocks inline NSFW media)
+      const first = posts[0];
+      const filterBlocked = err1?.code === 200000 || err2?.code === 200000;
+      const tip = filterBlocked
+        ? `\n-# Discord's Server Safety filter blocked inline NSFW upload in this non-NSFW channel — set **Server Settings → Safety Setup → Explicit Media Content Filter** to **"Do not filter"** for inline previews!`
+        : '';
+
+      const c = new ContainerBuilder();
+      c.addTextDisplayComponents(
+        text(
+          `**${site.label}** · \`${usedTags.join(' ') || 'random'}\` (ID #${first.id})` + tip
+        )
+      );
+      const btns = [];
+      if (includeNextButton) {
+        const encodedTags = usedTags.length > 0 ? usedTags.join(' ').slice(0, 72) : '_';
+        btns.push(button(`booru:next:${site.id}:${encodedTags}`, 'Another One', ButtonStyle.Primary));
+      }
+      btns.push(
+        new ButtonBuilder()
+          .setLabel('Open Image')
+          .setStyle(ButtonStyle.Link)
+          .setURL(first.fileUrl)
+      );
+      btns.push(
+        new ButtonBuilder()
+          .setLabel('Source Post')
+          .setStyle(ButtonStyle.Link)
+          .setURL(first.pageUrl)
+      );
+      c.addSeparatorComponents(thinDivider());
+      c.addActionRowComponents(actionRow(...btns));
+
+      return await sendFn({
+        components: [c],
+        flags: MessageFlags.IsComponentsV2,
+      });
+    }
+  }
 }
 
 export function buildMissingKeyMessage(site) {
