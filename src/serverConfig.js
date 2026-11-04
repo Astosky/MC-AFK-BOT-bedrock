@@ -4,7 +4,8 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SETTINGS_DIR = path.join(__dirname, '..', 'auth-cache');
-const SETTINGS_FILE = path.join(SETTINGS_DIR, 'server-settings.json');
+const SETTINGS_FILE = path.join(SETTINGS_DIR, 'server-settings.dat');
+const LEGACY_SETTINGS_FILE = path.join(SETTINGS_DIR, 'server-settings.json');
 
 // Sanitize Discord markdown links, <http://...>, schemes, and split host[:port]
 export function parseServerAddress(raw, defaultPort = 19132) {
@@ -86,16 +87,19 @@ function parseEnvDefaultServer() {
 }
 
 function loadSettingsStore() {
-  try {
-    const data = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
-    if (data && typeof data === 'object') {
-      return {
-        defaultServer: data.defaultServer || null,
-        guilds: data.guilds && typeof data.guilds === 'object' ? data.guilds : {},
-      };
+  for (const filePath of [SETTINGS_FILE, LEGACY_SETTINGS_FILE]) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (data && typeof data === 'object') {
+        return {
+          defaultServer: data.defaultServer || null,
+          guilds: data.guilds && typeof data.guilds === 'object' ? data.guilds : {},
+        };
+      }
+    } catch {
+      // Not created yet
     }
-  } catch {
-    // Not created yet
   }
   return { defaultServer: null, guilds: {} };
 }

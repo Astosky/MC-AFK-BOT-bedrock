@@ -21,7 +21,10 @@ import {
 } from './ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.join(__dirname, '..', 'auth-cache', 'booru-config.json');
+// Write runtime state to .dat so nodemon's default *.json watcher never kills the bot mid-command!
+// Still reads legacy booru-config.json seamlessly so already-saved keys keep working.
+const CONFIG_PATH = path.join(__dirname, '..', 'auth-cache', 'booru-config.dat');
+const LEGACY_CONFIG_PATH = path.join(__dirname, '..', 'auth-cache', 'booru-config.json');
 
 const API_USER_AGENT = 'AstoBot/2.2 (Discord Bot; +https://github.com/Astosky/MC-AFK-BOT-bedrock)';
 const CDN_USER_AGENT = 'curl/8.7.1';
@@ -164,24 +167,32 @@ export function resolveBooruSite(raw = '') {
   return key ? BOORU_SITES[key] : null;
 }
 
-// ─── Config & Seen History Persistence ───────────────────────────────────────
+// ─── Config & In-Memory Seen History ─────────────────────────────────────────
+
+const seenMemory = new Map();
 
 function readConfig() {
-  try {
-    if (!fs.existsSync(CONFIG_PATH)) return { keys: {}, seen: {} };
-    const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-    return {
-      keys: parsed?.keys && typeof parsed.keys === 'object' ? parsed.keys : {},
-      seen: parsed?.seen && typeof parsed.seen === 'object' ? parsed.seen : {},
-    };
-  } catch {
-    return { keys: {}, seen: {} };
+  const mergedKeys = {};
+  for (const filePath of [LEGACY_CONFIG_PATH, CONFIG_PATH]) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (parsed?.keys && typeof parsed.keys === 'object') {
+        for (const [k, v] of Object.entries(parsed.keys)) {
+          if (v === null) delete mergedKeys[k];
+          else mergedKeys[k] = v;
+        }
+      }
+    } catch {
+      // Ignore unreadable file
+    }
   }
+  return { keys: mergedKeys };
 }
 
 function writeConfig(cfg) {
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify({ keys: cfg.keys || {} }, null, 2), 'utf8');
 }
 
 function isValidCredPair(userId, apiKey) {
@@ -297,30 +308,25 @@ export function setBooruCredentials(siteId, { userId, apiKey }) {
 
 export function clearBooruCredentials(siteId) {
   const cfg = readConfig();
-  if (cfg.keys?.[siteId]) {
-    delete cfg.keys[siteId];
-    writeConfig(cfg);
-  }
+  cfg.keys[siteId] = null;
+  writeConfig(cfg);
 }
 
 function getSeenSet(guildId) {
-  const cfg = readConfig();
-  const list = Array.isArray(cfg.seen?.[guildId || 'global']) ? cfg.seen[guildId || 'global'] : [];
+  const gKey = guildId || 'global';
+  const list = seenMemory.get(gKey) || [];
   return new Set(list);
 }
 
 function recordSeenPost(guildId, postKey) {
   const gKey = guildId || 'global';
-  const cfg = readConfig();
-  if (!cfg.seen) cfg.seen = {};
-  const list = Array.isArray(cfg.seen[gKey]) ? cfg.seen[gKey] : [];
+  const list = seenMemory.get(gKey) || [];
   if (!list.includes(postKey)) {
     list.push(postKey);
     if (list.length > MAX_SEEN_HISTORY) {
       list.splice(0, list.length - MAX_SEEN_HISTORY);
     }
-    cfg.seen[gKey] = list;
-    writeConfig(cfg);
+    seenMemory.set(gKey, list);
   }
 }
 
