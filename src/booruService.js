@@ -269,6 +269,8 @@ function postPassesSafetyAndRating(post, { allowNsfw }) {
     if (BLOCKED_TAGS.has(t)) return false;
   }
 
+  return true;
+}
 
 function normalizeUrl(u) {
   if (!u || typeof u !== 'string') return null;
@@ -278,7 +280,7 @@ function normalizeUrl(u) {
   return trimmed;
 }
 
-// ─── API Fetchers ────────────────────────────────────────────────────────────
+// ─── API Fetchers ──────────────────────────────────────────────────────────
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
