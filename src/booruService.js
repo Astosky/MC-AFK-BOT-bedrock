@@ -681,7 +681,7 @@ export async function fetchBooruPosts({
 
   if (site.nsfwOnly && !allowNsfw) {
     const err = new Error(`**${site.label}** can only be used in an **Age-Restricted (NSFW)** Discord channel.`);
-    err.nsfwRequired = true;
+    err.nsfwRequired = false;
     throw err;
   }
 
