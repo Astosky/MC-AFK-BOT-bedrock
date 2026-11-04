@@ -80,7 +80,7 @@ export const BOORU_SITES = {
   r34: {
     id: 'r34',
     label: 'Rule34',
-    nsfwOnly: true, // Strictly requires an Age-Restricted (NSFW) Discord channel
+    nsfwOnly: false, // Strictly requires an Age-Restricted (NSFW) Discord channel
     requiresKey: true,
     referer: 'https://rule34.xxx/',
     keyHelpUrl: 'https://rule34.xxx/index.php?page=account&s=options',
@@ -269,15 +269,6 @@ function postPassesSafetyAndRating(post, { allowNsfw }) {
     if (BLOCKED_TAGS.has(t)) return false;
   }
 
-  // Enforce SFW rating in non-NSFW Discord channels
-  if (!allowNsfw) {
-    const r = String(post.rating || '').toLowerCase();
-    const isSafe = r === 'general' || r === 'g' || r === 'safe' || r === 's';
-    if (!isSafe) return false;
-  }
-
-  return true;
-}
 
 function normalizeUrl(u) {
   if (!u || typeof u !== 'string') return null;
