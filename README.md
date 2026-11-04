@@ -1,16 +1,15 @@
-# AeroX Minecraft AFK Bot (Bedrock 26.60 & Java)
+# Asto Minecraft Bot
 
-A Discord-controlled Minecraft AFK bot supporting **Bedrock Edition** (including latest **26.60 / 1.26.60**, NetherNet HTTP/HTTPS & RakNet) as well as **Java Edition**. Supports both cracked (offline-mode) and premium (Microsoft / Xbox Live) accounts.
+A Discord-controlled Minecraft AFK bot for **Bedrock** and **Java** servers.
 
 ---
 
 ## What It Does
 
 - Join any **Bedrock** (default port `19132`) or **Java** (default port `25565`) server through Discord commands
-- Supports **Bedrock 26.60 (`1.26.60`)** including the new **NetherNet** HTTP/HTTPS WebRTC transport (used by Aternos, Bedrock Dedicated Server 26.60, and GeyserMC) as well as RakNet for older servers
 - Keeps bots alive with automatic jumping, camera rotation, and auto-respawning
 - Supports Microsoft / Xbox Live OAuth for online-mode servers — authentication code sent directly in Discord
-- Auto-registers / logs in on servers running AuthMe, SimpleAuth, or similar plugins (using Bedrock `command_request` packets for `/` commands)
+- Auto-registers / logs in on servers running AuthMe, SimpleAuth, or similar plugins
 - Relays in-game chat to your Discord channel
 - Auto-reconnects up to 5 times with clear disconnect/error diagnostics
 - Manage multiple Bedrock and Java bots simultaneously across different servers
@@ -40,11 +39,6 @@ Save your server once with `!setserver`, and you can use short commands without 
 | `!say [username] <message>` | Send chat or a `/command` in-game |
 | `!jump` / `!sneak` / `!coords` | Jump, toggle crouch, or check live `X / Y / Z` coordinates & uptime |
 | `!leave [username \| all]` | Disconnect a bot or all active bots |
-| `!gelbooru [tags...]` | Fetch & upload from Gelbooru (`!gelbouru`, `!gel`; add `x3` for multiple) |
-| `!r34 [tags...]` | Fetch & upload from Rule34 (`!rule34`, add `x3` for up to 5 images) |
-| `!safebooru` / `!danbooru [tags...]` | Keyless fetch & upload from Safebooru or Danbooru |
-| `!autopost <site> <HH:MM \| every Xh> [tags]` | Schedule daily or interval auto-uploads (`!autopost` to view/manage) |
-| `!boorukey <gelbooru\|r34> <id> <key>` | Save your free Gelbooru / Rule34 API credentials |
 | `!help` | Show the command list |
 
 > **Tip:** Wrap Bedrock gamertags containing spaces in quotes, e.g. `!join bedrock RndmCraft.aternos.me "My Bot"`.
