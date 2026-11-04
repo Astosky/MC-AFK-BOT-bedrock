@@ -26,6 +26,7 @@ import {
   resolveBooruSite,
   getBooruCredentials,
   parseCredentialInput,
+  verifyBooruCredentials,
   setBooruCredentials,
   clearBooruCredentials,
   fetchBooruPosts,
@@ -183,7 +184,7 @@ function buildHelp(defaultServer) {
 
 // ─── Per-user command rate limiting ───────────────────────────────────────────
 
-const COOLDOWN_MS = 1_500;
+const COOLDOWN_MS = 750;
 const cooldowns = new Map();
 
 function isRateLimited(userId) {
@@ -370,10 +371,14 @@ const COMMAND_ALIASES = {
   '!wave': '!hit',
   '!nearby': '!players',
   '!gelbouru': '!gelbooru',
+  '!gelborou': '!gelbooru',
+  '!gelboru': '!gelbooru',
   '!gel': '!gelbooru',
   '!rule34': '!r34',
   '!safe': '!safebooru',
   '!dan': '!danbooru',
+  '!kona': '!konachan',
+  '!yan': '!yandere',
   '!autoupload': '!autopost',
   '!schedule': '!autopost',
   '!daily': '!autopost',
@@ -405,6 +410,8 @@ const KNOWN_COMMANDS = new Set([
   '!r34',
   '!safebooru',
   '!danbooru',
+  '!konachan',
+  '!yandere',
   '!boorukey',
   '!autopost',
   ...Object.keys(COMMAND_ALIASES),
@@ -443,7 +450,7 @@ async function handleBooruFetchCommand(message, siteInput, rawTagTokens) {
         !allowNsfw && result.site.id !== 'safebooru'
           ? '\n-# Note: This channel is not Age-Restricted (NSFW), so only SFW (`rating:general`) posts are searched.'
           : '';
-      return message.reply(
+      return await message.reply(
         msg(
           `No matching posts found on **${result.site.label}** for \`${tags.join(' ') || 'random'}\`.${sfwHint}`
         )
@@ -457,12 +464,26 @@ async function handleBooruFetchCommand(message, siteInput, rawTagTokens) {
       includeNextButton: true,
     });
 
-    return message.reply(payload);
+    try {
+      return await message.reply(payload);
+    } catch {
+      // Fallback if Discord cannot unfurl an external URL inside V2 MediaGallery
+      const first = result.posts[0];
+      const fallbackOpts = {
+        content: `**${result.site.label}** · \`${result.usedTags.join(' ') || 'random'}\`\n<${first.pageUrl}>`,
+      };
+      if (payload.files?.length) {
+        fallbackOpts.files = payload.files;
+      } else {
+        fallbackOpts.content += `\n${first.fileUrl}`;
+      }
+      return await message.reply(fallbackOpts);
+    }
   } catch (err) {
     if (err?.missingAuth && err.site) {
-      return message.reply(msg(buildMissingKeyMessage(err.site)));
+      return await message.reply(msg(buildMissingKeyMessage(err.site))).catch(() => {});
     }
-    return message.reply(msg(err?.message || 'Failed to fetch posts right now.'));
+    return await message.reply(msg(err?.message || 'Failed to fetch posts right now.')).catch(() => {});
   }
 }
 
@@ -822,12 +843,14 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // !gelbooru / !r34 / !safebooru / !danbooru [tags...]
+  // !gelbooru / !r34 / !safebooru / !danbooru / !konachan / !yandere [tags...]
   if (
     command === '!gelbooru' ||
     command === '!r34' ||
     command === '!safebooru' ||
-    command === '!danbooru'
+    command === '!danbooru' ||
+    command === '!konachan' ||
+    command === '!yandere'
   ) {
     const siteId = command.slice(1);
     await handleBooruFetchCommand(message, siteId, args.slice(1));
@@ -839,15 +862,15 @@ client.on('messageCreate', async (message) => {
     if (!args[1]) {
       return message.reply(
         msg(
-          'usage: `!booru <gelbooru|r34|safebooru|danbooru> [tags...]`\n' +
-          '-# Or use shortcuts directly: `!gelbooru [tags]`, `!r34 [tags]`, `!safebooru [tags]`, `!danbooru [tags]` *(add `x3` for multiple images)*'
+          'usage: `!booru <gelbooru|r34|safebooru|konachan|yandere|danbooru> [tags...]`\n' +
+          '-# Or use shortcuts directly: `!gelbooru`, `!r34`, `!safebooru`, `!konachan`, `!yandere` *(add `x3` for multiple images)*'
         )
       );
     }
     const site = resolveBooruSite(args[1]);
     if (!site) {
       return message.reply(
-        msg('Unknown site — choose `gelbooru`, `r34`, `safebooru`, or `danbooru`.')
+        msg('Unknown site — choose `gelbooru`, `r34`, `safebooru`, `konachan`, `yandere`, or `danbooru`.')
       );
     }
     await handleBooruFetchCommand(message, site, args.slice(2));
@@ -864,8 +887,8 @@ client.on('messageCreate', async (message) => {
           `**Booru API Keys**\n` +
           `• **Gelbooru:** ${gelStatus} — <${BOORU_SITES.gelbooru.keyHelpUrl}>\n` +
           `• **Rule34:** ${r34Status} — <${BOORU_SITES.r34.keyHelpUrl}>\n` +
-          `• **Safebooru & Danbooru:** Ready *(no key needed)*\n\n` +
-          `-# Save a key: \`!boorukey <gelbooru|r34> <user_id> <api_key>\` *(or paste \`&api_key=...&user_id=...\`)*.`
+          `• **Safebooru / Konachan / Yande.re / Danbooru:** Ready *(no key needed)*\n\n` +
+          `-# Save a key: \`!boorukey <gelbooru|r34> &api_key=YOUR_KEY&user_id=YOUR_ID_NUMBER\``
         )
       );
     }
@@ -880,23 +903,54 @@ client.on('messageCreate', async (message) => {
     const site = resolveBooruSite(args[1]);
     if (!site || !site.requiresKey) {
       return message.reply(
-        msg('Specify `gelbooru` or `r34`: `!boorukey <gelbooru|r34> <user_id> <api_key>`')
+        msg('Specify `gelbooru` or `r34`: `!boorukey <gelbooru|r34> &api_key=YOUR_KEY&user_id=YOUR_ID_NUMBER`')
       );
     }
 
     const creds = parseCredentialInput(args.slice(2));
-    if (!creds) {
+    if (creds.error === 'empty_api_key') {
+      const uidHint = creds.partialUserId || '7006715';
+      return message.reply(
+        msg(
+          `**Your \`api_key=\` is currently blank** (you pasted \`&api_key=&user_id=${uidHint}\`)!\n\n` +
+          `**How to generate your key on ${site.label}:**\n` +
+          `1. Open <${site.keyHelpUrl}>\n` +
+          `2. Scroll down to **API Access Credentials**\n` +
+          `3. **Check the box \`Generate New Key?\`**\n` +
+          `4. Scroll all the way down and click **Save**\n` +
+          `5. Open <${site.keyHelpUrl}> again — now there will be a long code after \`api_key=\`! Copy it and run:\n` +
+          `   \`!boorukey ${site.id} &api_key=YOUR_LONG_CODE&user_id=${uidHint}\``
+        )
+      );
+    }
+
+    if (creds.error === 'non_numeric_user_id') {
+      return message.reply(
+        msg(
+          `**\`user_id\` must be your numeric ID** (like \`7006715\`), not your username!\n` +
+          `-# Example: \`!boorukey ${site.id} &api_key=YOUR_LONG_CODE&user_id=7006715\``
+        )
+      );
+    }
+
+    if (creds.error) {
       return message.reply(msg(buildMissingKeyMessage(site)));
     }
 
     // Delete command message to keep user's API key private in chat
     message.delete().catch(() => {});
+
+    const check = await verifyBooruCredentials(site, creds);
+    if (!check.ok) {
+      return message.channel.send(msg(check.reason));
+    }
+
     setBooruCredentials(site.id, creds);
 
     return message.channel.send(
       msg(
-        `Saved **${site.label}** API credentials (User ID \`${creds.userId}\`)!\n` +
-        `-# Try \`!${site.id}\` or schedule daily uploads with \`!autopost ${site.id} 18:00 [tags]\`.`
+        `Verified & saved **${site.label}** API key (User ID \`${creds.userId}\`)!\n` +
+        `-# Try \`!${site.id}\` now, or schedule daily uploads with \`!autopost ${site.id} 18:00 [tags]\`.`
       )
     );
   }
@@ -1069,7 +1123,8 @@ client.on('interactionCreate', async (interaction) => {
       const rest = customId.slice('booru:next:'.length);
       const colonIdx = rest.indexOf(':');
       const siteId = colonIdx === -1 ? rest : rest.slice(0, colonIdx);
-      const tagStr = colonIdx === -1 ? '' : rest.slice(colonIdx + 1);
+      const rawTagPart = colonIdx === -1 ? '' : rest.slice(colonIdx + 1);
+      const tagStr = rawTagPart === '_' ? '' : rawTagPart;
       const rawTags = tagStr ? tagStr.split(/\s+/).filter(Boolean) : [];
 
       await interaction.deferReply();
