@@ -23,7 +23,8 @@ import {
 } from './ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SCHEDULES_PATH = path.join(__dirname, '..', 'auth-cache', 'booru-schedules.json');
+const SCHEDULES_PATH = path.join(__dirname, '..', 'auth-cache', 'booru-schedules.dat');
+const LEGACY_SCHEDULES_PATH = path.join(__dirname, '..', 'auth-cache', 'booru-schedules.json');
 const CHECK_INTERVAL_MS = 20_000; // Check schedules every 20 seconds
 const DEFAULT_TIMEZONE = process.env.BOORU_TZ?.trim() || process.env.TZ?.trim() || 'Africa/Algiers';
 
@@ -206,19 +207,22 @@ export class BooruScheduler {
   }
 
   _loadState() {
-    try {
-      if (!fs.existsSync(SCHEDULES_PATH)) {
-        return { nextId: 1, timezones: {}, schedules: [] };
+    for (const filePath of [SCHEDULES_PATH, LEGACY_SCHEDULES_PATH]) {
+      try {
+        if (!fs.existsSync(filePath)) continue;
+        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        if (parsed && typeof parsed === 'object') {
+          return {
+            nextId: Number(parsed.nextId) || 1,
+            timezones: parsed.timezones && typeof parsed.timezones === 'object' ? parsed.timezones : {},
+            schedules: Array.isArray(parsed.schedules) ? parsed.schedules : [],
+          };
+        }
+      } catch {
+        // Try next path
       }
-      const parsed = JSON.parse(fs.readFileSync(SCHEDULES_PATH, 'utf8'));
-      return {
-        nextId: Number(parsed?.nextId) || 1,
-        timezones: parsed?.timezones && typeof parsed.timezones === 'object' ? parsed.timezones : {},
-        schedules: Array.isArray(parsed?.schedules) ? parsed.schedules : [],
-      };
-    } catch {
-      return { nextId: 1, timezones: {}, schedules: [] };
     }
+    return { nextId: 1, timezones: {}, schedules: [] };
   }
 
   _saveState() {
