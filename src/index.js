@@ -21,6 +21,22 @@ import {
   setDefaultServer,
   clearDefaultServer,
 } from './serverConfig.js';
+import {
+  BOORU_SITES,
+  resolveBooruSite,
+  getBooruCredentials,
+  parseCredentialInput,
+  setBooruCredentials,
+  clearBooruCredentials,
+  fetchBooruPosts,
+  buildBooruMessagePayload,
+  buildMissingKeyMessage,
+} from './booruService.js';
+import {
+  BooruScheduler,
+  getClockInTimezone,
+  parseScheduleSpec,
+} from './booruScheduler.js';
 
 // ─── Startup validation ────────────────────────────────────────────────────────
 
@@ -69,6 +85,7 @@ async function syncBotApplicationBio() {
 const botManager = new BotManager({
   onChange: () => syncDiscordPresence(),
 });
+const booruScheduler = new BooruScheduler(client);
 
 client.on('clientReady', () => {
   if (GUILD_ID) {
@@ -78,6 +95,7 @@ client.on('clientReady', () => {
   }
   syncDiscordPresence();
   syncBotApplicationBio();
+  booruScheduler.start();
   setInterval(syncDiscordPresence, 60_000).unref?.();
 });
 
@@ -106,10 +124,18 @@ const GAMEPLAY_COMMANDS = [
   { usage: '!stop',                  desc: 'Stop following / playing / dancing and return to AFK.' },
 ];
 
+const MEDIA_COMMANDS = [
+  { usage: '!gelbooru [tags...]',                  desc: 'Fetch & upload from Gelbooru (also `!gelbouru`, `!gel`).' },
+  { usage: '!r34 [tags...]',                       desc: 'Fetch & upload from Rule34 *(NSFW channel required)*.' },
+  { usage: '!safebooru / !danbooru [tags...]',     desc: 'Keyless fetch & upload from Safebooru or Danbooru.' },
+  { usage: '!autopost <site> <HH:MM|every Xh> [tags]', desc: 'Auto-upload daily at a set time or interval (`!autopost` to manage).' },
+  { usage: '!boorukey <gelbooru|r34> <id> <key>',  desc: 'Save your free Gelbooru / Rule34 API credentials.' },
+];
+
 function buildHelp(defaultServer) {
   const c = new ContainerBuilder();
 
-  c.addTextDisplayComponents(text('## MC AFK Bot Commands'));
+  c.addTextDisplayComponents(text('## Bot Commands'));
   c.addSeparatorComponents(thinDivider());
 
   const connLines = CONNECTION_COMMANDS
@@ -120,18 +146,24 @@ function buildHelp(defaultServer) {
     .map((cmd) => `\`${cmd.usage}\` — ${cmd.desc}`)
     .join('\n');
 
+  const mediaLines = MEDIA_COMMANDS
+    .map((cmd) => `\`${cmd.usage}\` — ${cmd.desc}`)
+    .join('\n');
+
   const defaultLine = defaultServer
     ? `\n\n**Default Server:** \`${defaultServer.host}:${defaultServer.port}\` (${defaultServer.edition === 'java' ? 'Java' : 'Bedrock'})`
     : '\n\n**Tip:** Run `!setserver <ip[:port]>` once so you can just type `!join AFKBot`, `!follow Asto`, or `!play`!';
 
   c.addTextDisplayComponents(
     text(
-      '**Minecraft Bedrock (26.60) & Java AFK + Gameplay Bot**' +
+      '**Minecraft Bedrock (26.60) & Java AFK + Auto-Upload Bot**' +
       defaultLine +
       '\n\n**Setup & Connection:**\n' +
       connLines +
       '\n\n**Gameplay & Actions:**\n' +
-      playLines
+      playLines +
+      '\n\n**Booru Fetch & Scheduled Auto-Uploads:**\n' +
+      mediaLines
     )
   );
 
@@ -337,6 +369,14 @@ const COMMAND_ALIASES = {
   '!attack': '!hit',
   '!wave': '!hit',
   '!nearby': '!players',
+  '!gelbouru': '!gelbooru',
+  '!gel': '!gelbooru',
+  '!rule34': '!r34',
+  '!safe': '!safebooru',
+  '!dan': '!danbooru',
+  '!autoupload': '!autopost',
+  '!schedule': '!autopost',
+  '!daily': '!autopost',
 };
 
 const KNOWN_COMMANDS = new Set([
@@ -360,8 +400,71 @@ const KNOWN_COMMANDS = new Set([
   '!hit',
   '!spin',
   '!players',
+  '!booru',
+  '!gelbooru',
+  '!r34',
+  '!safebooru',
+  '!danbooru',
+  '!boorukey',
+  '!autopost',
   ...Object.keys(COMMAND_ALIASES),
 ]);
+
+function extractCountAndTags(rawList = []) {
+  let count = 1;
+  const tags = [];
+  for (const item of rawList) {
+    const m = String(item).match(/^(?:x|count:)([1-5])$/i);
+    if (m) {
+      count = Number(m[1]);
+    } else {
+      tags.push(item);
+    }
+  }
+  return { count, tags };
+}
+
+async function handleBooruFetchCommand(message, siteInput, rawTagTokens) {
+  const { count, tags } = extractCountAndTags(rawTagTokens);
+  const allowNsfw = Boolean(message.channel?.nsfw);
+
+  try {
+    await message.channel.sendTyping?.().catch(() => {});
+    const result = await fetchBooruPosts({
+      siteInput,
+      rawTags: tags,
+      allowNsfw,
+      count,
+      guildId: message.guild.id,
+    });
+
+    if (result.posts.length === 0) {
+      const sfwHint =
+        !allowNsfw && result.site.id !== 'safebooru'
+          ? '\n-# Note: This channel is not Age-Restricted (NSFW), so only SFW (`rating:general`) posts are searched.'
+          : '';
+      return message.reply(
+        msg(
+          `No matching posts found on **${result.site.label}** for \`${tags.join(' ') || 'random'}\`.${sfwHint}`
+        )
+      );
+    }
+
+    const payload = await buildBooruMessagePayload({
+      site: result.site,
+      posts: result.posts,
+      usedTags: result.usedTags,
+      includeNextButton: true,
+    });
+
+    return message.reply(payload);
+  } catch (err) {
+    if (err?.missingAuth && err.site) {
+      return message.reply(msg(buildMissingKeyMessage(err.site)));
+    }
+    return message.reply(msg(err?.message || 'Failed to fetch posts right now.'));
+  }
+}
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
@@ -718,6 +821,230 @@ client.on('messageCreate', async (message) => {
     botManager.coords(target.username, target.host, message.channel, defaultHost);
     return;
   }
+
+  // !gelbooru / !r34 / !safebooru / !danbooru [tags...]
+  if (
+    command === '!gelbooru' ||
+    command === '!r34' ||
+    command === '!safebooru' ||
+    command === '!danbooru'
+  ) {
+    const siteId = command.slice(1);
+    await handleBooruFetchCommand(message, siteId, args.slice(1));
+    return;
+  }
+
+  // !booru <site> [tags...]
+  if (command === '!booru') {
+    if (!args[1]) {
+      return message.reply(
+        msg(
+          'usage: `!booru <gelbooru|r34|safebooru|danbooru> [tags...]`\n' +
+          '-# Or use shortcuts directly: `!gelbooru [tags]`, `!r34 [tags]`, `!safebooru [tags]`, `!danbooru [tags]` *(add `x3` for multiple images)*'
+        )
+      );
+    }
+    const site = resolveBooruSite(args[1]);
+    if (!site) {
+      return message.reply(
+        msg('Unknown site — choose `gelbooru`, `r34`, `safebooru`, or `danbooru`.')
+      );
+    }
+    await handleBooruFetchCommand(message, site, args.slice(2));
+    return;
+  }
+
+  // !boorukey [<site> <user_id> <api_key> | clear <site>]
+  if (command === '!boorukey') {
+    if (!args[1]) {
+      const gelStatus = getBooruCredentials('gelbooru') ? 'Configured' : 'Not set';
+      const r34Status = getBooruCredentials('r34') ? 'Configured' : 'Not set';
+      return message.reply(
+        msg(
+          `**Booru API Keys**\n` +
+          `• **Gelbooru:** ${gelStatus} — <${BOORU_SITES.gelbooru.keyHelpUrl}>\n` +
+          `• **Rule34:** ${r34Status} — <${BOORU_SITES.r34.keyHelpUrl}>\n` +
+          `• **Safebooru & Danbooru:** Ready *(no key needed)*\n\n` +
+          `-# Save a key: \`!boorukey <gelbooru|r34> <user_id> <api_key>\` *(or paste \`&api_key=...&user_id=...\`)*.`
+        )
+      );
+    }
+
+    if (args[1].toLowerCase() === 'clear' && args[2]) {
+      const targetSite = resolveBooruSite(args[2]);
+      if (!targetSite) return message.reply(msg('Unknown site (`gelbooru` or `r34`).'));
+      clearBooruCredentials(targetSite.id);
+      return message.reply(msg(`Cleared saved API credentials for **${targetSite.label}**.`));
+    }
+
+    const site = resolveBooruSite(args[1]);
+    if (!site || !site.requiresKey) {
+      return message.reply(
+        msg('Specify `gelbooru` or `r34`: `!boorukey <gelbooru|r34> <user_id> <api_key>`')
+      );
+    }
+
+    const creds = parseCredentialInput(args.slice(2));
+    if (!creds) {
+      return message.reply(msg(buildMissingKeyMessage(site)));
+    }
+
+    // Delete command message to keep user's API key private in chat
+    message.delete().catch(() => {});
+    setBooruCredentials(site.id, creds);
+
+    return message.channel.send(
+      msg(
+        `Saved **${site.label}** API credentials (User ID \`${creds.userId}\`)!\n` +
+        `-# Try \`!${site.id}\` or schedule daily uploads with \`!autopost ${site.id} 18:00 [tags]\`.`
+      )
+    );
+  }
+
+  // !autopost / !autoupload / !schedule / !daily
+  if (command === '!autopost') {
+    const sub = args[1]?.toLowerCase();
+
+    if (!sub || sub === 'list' || sub === 'status') {
+      return message.reply(booruScheduler.buildSchedulesPanel(message.guild.id));
+    }
+
+    if (sub === 'tz' || sub === 'timezone') {
+      const tzArg = args[2];
+      if (!tzArg) {
+        const currentTz = booruScheduler.getGuildTimezone(message.guild.id);
+        const clock = getClockInTimezone(currentTz);
+        return message.reply(
+          msg(
+            `**Current Timezone:** \`${clock.timezone}\` (Current bot clock: **${clock.formattedTime}**)\n` +
+            `-# Change with \`!autopost tz Africa/Algiers\`, \`!autopost tz UTC+1\`, \`!autopost tz Europe/Paris\`, etc.`
+          )
+        );
+      }
+      const ok = booruScheduler.setGuildTimezone(message.guild.id, tzArg);
+      if (!ok) {
+        return message.reply(
+          msg('Invalid timezone — examples: `Africa/Algiers`, `Europe/Paris`, `UTC+1`, `UTC-5`, `UTC`.')
+        );
+      }
+      const clock = getClockInTimezone(tzArg);
+      return message.reply(
+        msg(`Timezone updated to **${clock.timezone}** — current clock time is **${clock.formattedTime}**.`)
+      );
+    }
+
+    if (['remove', 'del', 'delete', 'stop', 'clear'].includes(sub)) {
+      const idArg = sub === 'clear' && !args[2] ? 'all' : args[2];
+      if (!idArg) {
+        return message.reply(msg('usage: `!autopost remove <id | all>`'));
+      }
+      const res = booruScheduler.removeSchedule(message.guild.id, idArg);
+      if (res.removed === 0) {
+        return message.reply(msg(res.all ? 'No active auto-upload schedules.' : `No schedule found with ID **#${idArg}**.`));
+      }
+      return message.reply(
+        msg(
+          res.all
+            ? `Removed all **${res.removed}** auto-upload schedule${res.removed === 1 ? '' : 's'}.`
+            : `Removed schedule **#${res.deleted.id}** (**${res.deleted.siteLabel}**).`
+        )
+      );
+    }
+
+    if (sub === 'now' || sub === 'test' || sub === 'run') {
+      const schedules = booruScheduler.getGuildSchedules(message.guild.id);
+      const targetSched = args[2]
+        ? booruScheduler.getScheduleById(message.guild.id, args[2].replace(/^#/, ''))
+        : schedules.length === 1
+          ? schedules[0]
+          : null;
+
+      if (!targetSched) {
+        return message.reply(
+          msg(
+            schedules.length === 0
+              ? 'No active schedules yet — create one with `!autopost <site> <HH:MM> [tags]`.'
+              : 'Specify which schedule ID to run: `!autopost now <id>` (check `!autopost` for IDs).'
+          )
+        );
+      }
+
+      await message.channel.sendTyping?.().catch(() => {});
+      const runRes = await booruScheduler.triggerScheduleNow(targetSched, { manual: true });
+      if (!runRes.ok) {
+        return message.reply(msg(`Could not trigger **#${targetSched.id}**: ${runRes.error}`));
+      }
+      return;
+    }
+
+    // Add schedule: `!autopost [add] <site> <time | daily | every Xh> [tags...]`
+    const offset = sub === 'add' ? 2 : 1;
+    const siteToken = args[offset];
+    const site = resolveBooruSite(siteToken);
+    if (!site) {
+      return message.reply(
+        msg(
+          'usage: `!autopost <gelbooru|r34|safebooru|danbooru> <HH:MM | daily | every 6h> [tags...]`\n' +
+          '-# Examples:\n' +
+          '-# • `!autopost gelbooru 18:00 blue_archive`\n' +
+          '-# • `!autopost r34 22:30 x2 overwatch`\n' +
+          '-# • `!autopost safebooru every 6h hatsune_miku`'
+        )
+      );
+    }
+
+    const tz = booruScheduler.getGuildTimezone(message.guild.id);
+    const currentClock = getClockInTimezone(tz);
+    const remainingTokens = args.slice(offset + 1);
+    const spec = parseScheduleSpec(remainingTokens, currentClock);
+
+    if (!spec) {
+      return message.reply(
+        msg(
+          `Specify when to auto-upload (e.g. \`18:00\`, \`8:30pm\`, \`daily\`, or \`every 6h\`):\n` +
+          `-# Example: \`!autopost ${site.id} 18:00 [tags...]\` *(current bot clock: **${currentClock.formattedTime}** ${currentClock.timezone})*`
+        )
+      );
+    }
+
+    const { count, tags } = extractCountAndTags(remainingTokens.slice(spec.consumed));
+    const created = booruScheduler.addSchedule({
+      guildId: message.guild.id,
+      channelId: message.channel.id,
+      siteInput: site.id,
+      mode: spec.mode,
+      time: spec.time || null,
+      intervalMinutes: spec.intervalMinutes || null,
+      rawTags: tags,
+      count,
+      allowNsfw: Boolean(message.channel?.nsfw),
+    });
+
+    if (!created.ok) {
+      return message.reply(msg(created.error));
+    }
+
+    const s = created.schedule;
+    const whenDesc =
+      s.mode === 'daily'
+        ? `every day at **${s.time}** (${created.clock.timezone})`
+        : `every **${s.intervalMinutes >= 60 && s.intervalMinutes % 60 === 0 ? `${s.intervalMinutes / 60}h` : `${s.intervalMinutes}m`}**`;
+    const tagDesc = s.tags.length > 0 ? `\`${s.tags.join(' ')}\`` : '`random`';
+    const keyWarning =
+      site.requiresKey && !getBooruCredentials(site.id)
+        ? `\n\n-# Don't forget to set your ${site.label} API key once with \`!boorukey ${site.id} <user_id> <api_key>\`!`
+        : '';
+
+    return message.reply(
+      msgWithButtons(
+        `Scheduled **#${s.id}** — **${site.label}** (${tagDesc}${s.count > 1 ? ` ×${s.count}` : ''})\n` +
+        `-# Auto-uploading in <#${s.channelId}> ${whenDesc} · Current bot clock: **${created.clock.formattedTime}**` +
+        keyWarning,
+        button(`autopost:now:${s.id}`, 'Post Now (Test)', ButtonStyle.Primary),
+        button(`autopost:del:${s.id}`, 'Cancel Schedule', ButtonStyle.Danger)
+      )
+    );
+  }
 });
 
 // ─── Interactive Button Handlers ──────────────────────────────────────────────
@@ -735,6 +1062,75 @@ client.on('interactionCreate', async (interaction) => {
   if (GUILD_ID && interaction.guildId !== GUILD_ID) return;
 
   const customId = interaction.customId || '';
+
+  // ─── Booru & Auto-Upload Interactive Buttons ──────────────────────────────
+  if (customId.startsWith('booru:next:')) {
+    try {
+      const rest = customId.slice('booru:next:'.length);
+      const colonIdx = rest.indexOf(':');
+      const siteId = colonIdx === -1 ? rest : rest.slice(0, colonIdx);
+      const tagStr = colonIdx === -1 ? '' : rest.slice(colonIdx + 1);
+      const rawTags = tagStr ? tagStr.split(/\s+/).filter(Boolean) : [];
+
+      await interaction.deferReply();
+      const result = await fetchBooruPosts({
+        siteInput: siteId,
+        rawTags,
+        allowNsfw: Boolean(interaction.channel?.nsfw),
+        count: 1,
+        guildId: interaction.guildId,
+      });
+
+      if (result.posts.length === 0) {
+        await interaction.editReply(msg(`No more matching posts found on **${result.site.label}**.`));
+        return;
+      }
+
+      const payload = await buildBooruMessagePayload({
+        site: result.site,
+        posts: result.posts,
+        usedTags: result.usedTags,
+        includeNextButton: true,
+      });
+      await interaction.editReply(payload);
+    } catch (err) {
+      const errText = err?.missingAuth && err.site ? buildMissingKeyMessage(err.site) : (err?.message || 'Failed to fetch.');
+      if (interaction.deferred) {
+        await interaction.editReply(msg(errText)).catch(() => {});
+      } else {
+        await interaction.reply({ content: errText, flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
+    }
+    return;
+  }
+
+  if (customId.startsWith('autopost:')) {
+    try {
+      const [, apAction, schedId] = customId.split(':');
+      if (apAction === 'del') {
+        booruScheduler.removeSchedule(interaction.guildId, schedId);
+        await interaction.update(booruScheduler.buildSchedulesPanel(interaction.guildId));
+        return;
+      }
+      if (apAction === 'now') {
+        const sched = booruScheduler.getScheduleById(interaction.guildId, schedId);
+        if (!sched) {
+          await interaction.reply({ content: `Schedule #${schedId} no longer exists.`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const res = await booruScheduler.triggerScheduleNow(sched, { manual: true });
+        await interaction.editReply({
+          content: res.ok ? `Uploaded post for schedule **#${sched.id}**!` : `Failed: ${res.error}`,
+        });
+        return;
+      }
+    } catch (err) {
+      console.error('[Autopost Button Error]', err);
+    }
+    return;
+  }
+
   if (!customId.startsWith('bot:')) return;
 
   const defaultServer = getDefaultServer(interaction.guildId);
