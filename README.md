@@ -41,7 +41,7 @@ Save your server once with `!setserver`, and you can use short commands without 
 | `!jump` / `!sneak` / `!coords` | Jump, toggle crouch, or check live `X / Y / Z` coordinates & uptime |
 | `!leave [username \| all]` | Disconnect a bot or all active bots |
 | `!gelbooru [tags...]` | Fetch & upload from Gelbooru (`!gelbouru`, `!gel`; add `x3` for multiple) |
-| `!r34 [tags...]` | Fetch & upload from Rule34 *(Age-Restricted NSFW channel required)* |
+| `!r34 [tags...]` | Fetch & upload from Rule34 (`!rule34`, add `x3` for up to 5 images) |
 | `!safebooru` / `!danbooru [tags...]` | Keyless fetch & upload from Safebooru or Danbooru |
 | `!autopost <site> <HH:MM \| every Xh> [tags]` | Schedule daily or interval auto-uploads (`!autopost` to view/manage) |
 | `!boorukey <gelbooru\|r34> <id> <key>` | Save your free Gelbooru / Rule34 API credentials |
