@@ -25,7 +25,7 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCHEDULES_PATH = path.join(__dirname, '..', 'auth-cache', 'booru-schedules.dat');
 const LEGACY_SCHEDULES_PATH = path.join(__dirname, '..', 'auth-cache', 'booru-schedules.json');
-const CHECK_INTERVAL_MS = 20_000; // Check schedules every 20 seconds
+const CHECK_INTERVAL_MS = 5_000; // Check schedules every 5 seconds so 1m / 30s intervals fire accurately
 const DEFAULT_TIMEZONE = process.env.BOORU_TZ?.trim() || process.env.TZ?.trim() || 'Africa/Algiers';
 
 // ─── Timezone & Clock Utilities ──────────────────────────────────────────────
@@ -107,7 +107,7 @@ export function parseScheduleSpec(tokens = [], currentClock) {
   let idx = 0;
   const first = tokens[0].toLowerCase();
 
-  // `every 6h` / `every 30m` / `every day`
+  // `every 1m` / `every 30s` / `every 6h` / `every 1 min` / `every minute` / `every day`
   if (first === 'every') {
     const second = (tokens[1] || '').toLowerCase();
     if (!second) return null;
@@ -120,6 +120,19 @@ export function parseScheduleSpec(tokens = [], currentClock) {
         return { mode: 'daily', time: maybeTime, consumed: idx + 1 };
       }
       return { mode: 'daily', time: currentClock.formattedTime, consumed: 2 };
+    }
+    if (second === 'minute' || second === 'min') {
+      return { mode: 'interval', intervalMinutes: 1, consumed: 2 };
+    }
+    if (second === 'hour' || second === 'hr') {
+      return { mode: 'interval', intervalMinutes: 60, consumed: 2 };
+    }
+    // Support separated number + unit, e.g. `every 1 m` or `every 5 mins`
+    if (/^\d+$/.test(second) && tokens[2]) {
+      const combinedIv = parseIntervalToken(`${second}${tokens[2]}`);
+      if (combinedIv) {
+        return { mode: 'interval', intervalMinutes: combinedIv, consumed: 3 };
+      }
     }
     const iv = parseIntervalToken(second);
     if (!iv) return null;
@@ -181,16 +194,25 @@ export function parseClockTimeToken(raw = '') {
 }
 
 function parseIntervalToken(raw = '') {
-  const m = String(raw || '').trim().toLowerCase().match(/^(\d+)\s*(m|min|mins|h|hr|hrs|d|day|days)$/);
+  const m = String(raw || '')
+    .trim()
+    .toLowerCase()
+    .match(/^(\d+)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/);
   if (!m) return null;
   const num = Number(m[1]);
   if (!num || num <= 0) return null;
   const unit = m[2][0];
+  if (unit === 's') {
+    // Allow 30s+ (0.5m minimum so Discord rate limits stay safe)
+    const minsFromSec = Math.max(30, num) / 60;
+    return Math.min(10080, minsFromSec);
+  }
   const mins = unit === 'd' ? num * 1440 : unit === 'h' ? num * 60 : num;
-  return Math.max(10, Math.min(10080, mins)); // Clamp between 10 mins and 7 days
+  return Math.max(1, Math.min(10080, mins)); // Allow 1m up to 7 days
 }
 
-function formatIntervalLabel(mins) {
+export function formatIntervalLabel(mins) {
+  if (mins < 1) return `every ${Math.round(mins * 60)}s`;
   if (mins % 1440 === 0) return `every ${mins / 1440}d`;
   if (mins % 60 === 0) return `every ${mins / 60}h`;
   return `every ${mins}m`;
@@ -416,7 +438,6 @@ export class BooruScheduler {
           sched.lastRunDate = clock.dateKey;
           sched.lastRunAt = nowMs;
           dirty = true;
-          this._saveState();
           this.triggerScheduleNow(sched).catch(() => {});
         }
       } else if (sched.mode === 'interval' && sched.intervalMinutes) {
@@ -425,7 +446,6 @@ export class BooruScheduler {
         if (nowMs - last >= intervalMs) {
           sched.lastRunAt = nowMs;
           dirty = true;
-          this._saveState();
           this.triggerScheduleNow(sched).catch(() => {});
         }
       }
