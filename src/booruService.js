@@ -89,7 +89,7 @@ export const BOORU_SITES = {
   r34: {
     id: 'r34',
     label: 'Rule34',
-    nsfwOnly: true,
+    nsfwOnly: false,
     requiresKey: true,
     referer: 'https://rule34.xxx/',
     keyHelpUrl: 'https://rule34.xxx/index.php?page=account&s=options',
@@ -407,8 +407,11 @@ async function queryDapiSite(site, searchTags, { allowNsfw, page = 0 }) {
     effectiveTags.push('rating:general');
   }
 
-  // Only append negative tags on Gelbooru/R34 (Safebooru's old DAPI returns empty on negative-only queries)
-  if (site.id === 'gelbooru' || site.id === 'r34') {
+  // Append server-side negative tags only when at least one positive tag is present
+  // (Gelbooru 0.2.x DAPI used by Rule34 & Safebooru returns empty on negative-only queries;
+  //  postPassesSafetyAndRating still enforces BLOCKED_TAGS on every returned post!)
+  const hasPositiveTag = effectiveTags.some((t) => t && !t.startsWith('-'));
+  if (hasPositiveTag && (site.id === 'gelbooru' || site.id === 'r34')) {
     if (!effectiveTags.includes('-loli')) effectiveTags.push('-loli');
     if (!effectiveTags.includes('-shota')) effectiveTags.push('-shota');
   }
@@ -670,7 +673,7 @@ async function fetchRawCandidates(site, tags, { allowNsfw }) {
 export async function fetchBooruPosts({
   siteInput,
   rawTags = [],
-  allowNsfw = false,
+  allowNsfw = true,
   count = 1,
   guildId = null,
 }) {
@@ -679,7 +682,9 @@ export async function fetchBooruPosts({
     throw new Error('Unknown booru site. Supported: `gelbooru`, `r34`, `safebooru`, `danbooru`, `konachan`, `yandere`');
   }
 
-  if (site.nsfwOnly && !allowNsfw) {
+  const effectiveAllowNsfw = site.id === 'safebooru' ? false : Boolean(allowNsfw);
+
+  if (site.nsfwOnly && !effectiveAllowNsfw) {
     const err = new Error(`**${site.label}** can only be used in an **Age-Restricted (NSFW)** Discord channel.`);
     err.nsfwRequired = true;
     throw err;
@@ -693,8 +698,8 @@ export async function fetchBooruPosts({
   }
 
   let usedTags = tagCheck.tags;
-  let candidates = await fetchRawCandidates(site, usedTags, { allowNsfw });
-  let valid = candidates.filter((p) => postPassesSafetyAndRating(p, { allowNsfw }));
+  let candidates = await fetchRawCandidates(site, usedTags, { allowNsfw: effectiveAllowNsfw });
+  let valid = candidates.filter((p) => postPassesSafetyAndRating(p, { allowNsfw: effectiveAllowNsfw }));
 
   // Retry 1: if user typed `!gelbooru blue archive` (spaces instead of `blue_archive`), retry underscored!
   if (
@@ -706,8 +711,8 @@ export async function fetchBooruPosts({
     const underscored = [usedTags.join('_')];
     const retryCheck = validateUserTags(underscored);
     if (retryCheck.ok) {
-      const retryCandidates = await fetchRawCandidates(site, underscored, { allowNsfw });
-      const retryValid = retryCandidates.filter((p) => postPassesSafetyAndRating(p, { allowNsfw }));
+      const retryCandidates = await fetchRawCandidates(site, underscored, { allowNsfw: effectiveAllowNsfw });
+      const retryValid = retryCandidates.filter((p) => postPassesSafetyAndRating(p, { allowNsfw: effectiveAllowNsfw }));
       if (retryValid.length > 0) {
         usedTags = underscored;
         valid = retryValid;
@@ -719,8 +724,8 @@ export async function fetchBooruPosts({
   if (valid.length === 0 && usedTags.length === 1) {
     const syn = COMMON_TAG_FALLBACKS[usedTags[0].toLowerCase()];
     if (syn) {
-      const synCandidates = await fetchRawCandidates(site, [syn], { allowNsfw });
-      const synValid = synCandidates.filter((p) => postPassesSafetyAndRating(p, { allowNsfw }));
+      const synCandidates = await fetchRawCandidates(site, [syn], { allowNsfw: effectiveAllowNsfw });
+      const synValid = synCandidates.filter((p) => postPassesSafetyAndRating(p, { allowNsfw: effectiveAllowNsfw }));
       if (synValid.length > 0) {
         usedTags = [syn];
         valid = synValid;

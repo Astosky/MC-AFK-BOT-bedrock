@@ -127,7 +127,7 @@ const GAMEPLAY_COMMANDS = [
 
 const MEDIA_COMMANDS = [
   { usage: '!gelbooru [tags...]',                  desc: 'Fetch & upload from Gelbooru (also `!gelbouru`, `!gel`).' },
-  { usage: '!r34 [tags...]',                       desc: 'Fetch & upload from Rule34 *(NSFW channel required)*.' },
+  { usage: '!r34 [tags...]',                       desc: 'Fetch & upload from Rule34 (`!rule34`).' },
   { usage: '!safebooru / !danbooru [tags...]',     desc: 'Keyless fetch & upload from Safebooru or Danbooru.' },
   { usage: '!autopost <site> <HH:MM|every Xh> [tags]', desc: 'Auto-upload daily at a set time or interval (`!autopost` to manage).' },
   { usage: '!boorukey <gelbooru|r34> <id> <key>',  desc: 'Save your free Gelbooru / Rule34 API credentials.' },
@@ -433,26 +433,21 @@ function extractCountAndTags(rawList = []) {
 
 async function handleBooruFetchCommand(message, siteInput, rawTagTokens) {
   const { count, tags } = extractCountAndTags(rawTagTokens);
-  const allowNsfw = Boolean(message.channel?.nsfw);
 
   try {
     await message.channel.sendTyping?.().catch(() => {});
     const result = await fetchBooruPosts({
       siteInput,
       rawTags: tags,
-      allowNsfw,
+      allowNsfw: true,
       count,
       guildId: message.guild.id,
     });
 
     if (result.posts.length === 0) {
-      const sfwHint =
-        !allowNsfw && result.site.id !== 'safebooru'
-          ? '\n-# Note: This channel is not Age-Restricted (NSFW), so only SFW (`rating:general`) posts are searched.'
-          : '';
       return await message.reply(
         msg(
-          `No matching posts found on **${result.site.label}** for \`${tags.join(' ') || 'random'}\`.${sfwHint}`
+          `No matching posts found on **${result.site.label}** for \`${tags.join(' ') || 'random'}\`.`
         )
       );
     }
@@ -1071,7 +1066,7 @@ client.on('messageCreate', async (message) => {
       intervalMinutes: spec.intervalMinutes || null,
       rawTags: tags,
       count,
-      allowNsfw: Boolean(message.channel?.nsfw),
+      allowNsfw: true,
     });
 
     if (!created.ok) {
@@ -1131,7 +1126,7 @@ client.on('interactionCreate', async (interaction) => {
       const result = await fetchBooruPosts({
         siteInput: siteId,
         rawTags,
-        allowNsfw: Boolean(interaction.channel?.nsfw),
+        allowNsfw: true,
         count: 1,
         guildId: interaction.guildId,
       });

@@ -260,10 +260,10 @@ export class BooruScheduler {
     return this.state.schedules.find((s) => s.guildId === guildId && String(s.id) === String(id)) || null;
   }
 
-  addSchedule({ guildId, channelId, siteInput, mode, time, intervalMinutes, rawTags = [], count = 1, allowNsfw = false }) {
+  addSchedule({ guildId, channelId, siteInput, mode, time, intervalMinutes, rawTags = [], count = 1, allowNsfw = true }) {
     const site = resolveBooruSite(siteInput);
     if (!site) {
-      return { ok: false, error: 'Unknown site. Use `gelbooru`, `r34`, `safebooru`, or `danbooru`.' };
+      return { ok: false, error: 'Unknown site. Use `gelbooru`, `r34`, `safebooru`, `konachan`, `yandere`, or `danbooru`.' };
     }
     if (site.nsfwOnly && !allowNsfw) {
       return {
@@ -345,11 +345,8 @@ export class BooruScheduler {
         return { ok: false, error: 'Target channel no longer exists or is inaccessible.' };
       }
 
-      const allowNsfw = Boolean(channel.nsfw);
       const site = resolveBooruSite(schedule.siteId);
-      if (site?.nsfwOnly && !allowNsfw) {
-        return { ok: false, error: `<#${schedule.channelId}> is no longer marked Age-Restricted (NSFW).` };
-      }
+      const allowNsfw = site?.id !== 'safebooru';
 
       const result = await fetchBooruPosts({
         siteInput: schedule.siteId,
@@ -461,7 +458,7 @@ export class BooruScheduler {
           `-# No active schedules · Bot clock: **${clock.formattedTime}** (${clock.timezone})\n\n` +
           `**Examples:**\n` +
           `\`!autopost gelbooru 18:00 blue_archive\` — post every day at 18:00\n` +
-          `\`!autopost r34 22:30 x2 overwatch\` — post 2 images daily at 22:30 *(NSFW channel)*\n` +
+          `\`!autopost r34 22:30 x2 overwatch\` — post 2 images daily at 22:30\n` +
           `\`!autopost safebooru every 6h hatsune_miku\` — post every 6 hours\n` +
           `\`!autopost tz UTC+1\` — change your server's clock timezone`
         )
