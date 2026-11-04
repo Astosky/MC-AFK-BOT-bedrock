@@ -378,7 +378,20 @@ export class BooruScheduler {
         includeNextButton: true,
       });
 
-      await channel.send(payload);
+      try {
+        await channel.send(payload);
+      } catch {
+        const first = result.posts[0];
+        const fallbackOpts = {
+          content: `**${headerPrefix}** — **${result.site.label}** · \`${result.usedTags.join(' ') || 'random'}\`\n<${first.pageUrl}>`,
+        };
+        if (payload.files?.length) {
+          fallbackOpts.files = payload.files;
+        } else {
+          fallbackOpts.content += `\n${first.fileUrl}`;
+        }
+        await channel.send(fallbackOpts);
+      }
       return { ok: true };
     } catch (err) {
       if (err?.missingAuth && err.site) {
