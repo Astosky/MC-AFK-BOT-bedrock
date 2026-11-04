@@ -5,7 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   fetchBooruPosts,
-  buildBooruMessagePayload,
+  deliverBooruResult,
   buildMissingKeyMessage,
   resolveBooruSite,
   validateUserTags,
@@ -367,28 +367,13 @@ export class BooruScheduler {
           ? `Daily Auto-Upload (#${schedule.id})`
           : `Scheduled Upload (#${schedule.id})`;
 
-      const payload = await buildBooruMessagePayload({
+      await deliverBooruResult((opts) => channel.send(opts), {
         site: result.site,
         posts: result.posts,
         usedTags: result.usedTags,
         headerPrefix,
         includeNextButton: true,
       });
-
-      try {
-        await channel.send(payload);
-      } catch {
-        const first = result.posts[0];
-        const fallbackOpts = {
-          content: `**${headerPrefix}** — **${result.site.label}** · \`${result.usedTags.join(' ') || 'random'}\`\n<${first.pageUrl}>`,
-        };
-        if (payload.files?.length) {
-          fallbackOpts.files = payload.files;
-        } else {
-          fallbackOpts.content += `\n${first.fileUrl}`;
-        }
-        await channel.send(fallbackOpts);
-      }
       return { ok: true };
     } catch (err) {
       if (err?.missingAuth && err.site) {
