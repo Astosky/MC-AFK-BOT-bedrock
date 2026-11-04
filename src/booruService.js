@@ -89,7 +89,7 @@ export const BOORU_SITES = {
   r34: {
     id: 'r34',
     label: 'Rule34',
-    nsfwOnly: true,
+    nsfwOnly: false,
     requiresKey: true,
     referer: 'https://rule34.xxx/',
     keyHelpUrl: 'https://rule34.xxx/index.php?page=account&s=options',
