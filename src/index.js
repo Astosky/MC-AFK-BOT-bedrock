@@ -37,6 +37,7 @@ import {
   BooruScheduler,
   getClockInTimezone,
   parseScheduleSpec,
+  formatIntervalLabel,
 } from './booruScheduler.js';
 
 // ─── Startup validation ────────────────────────────────────────────────────────
@@ -1072,7 +1073,7 @@ client.on('messageCreate', async (message) => {
     const whenDesc =
       s.mode === 'daily'
         ? `every day at **${s.time}** (${created.clock.timezone})`
-        : `every **${s.intervalMinutes >= 60 && s.intervalMinutes % 60 === 0 ? `${s.intervalMinutes / 60}h` : `${s.intervalMinutes}m`}**`;
+        : `**${formatIntervalLabel(s.intervalMinutes)}**`;
     const tagDesc = s.tags.length > 0 ? `\`${s.tags.join(' ')}\`` : '`random`';
     const keyWarning =
       site.requiresKey && !getBooruCredentials(site.id)
